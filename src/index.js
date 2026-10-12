@@ -53,6 +53,7 @@ const DEFAULT_CONFIG = {
   punishment: 'quarantine',
   blockNewBots: false,
   autoRoleId: null,
+  autoRoleId2: null,
   ownerRoleId: null,
   coOwnerRoleId: null,
   adminRoleId: null,
@@ -73,6 +74,7 @@ const DEFAULT_CONFIG = {
     categoryId: null,
     createChannelId: null,
     roomName: "{user}'s room",
+    owners: {},
   },
   ticketPanel: {
     channelId: null,
@@ -89,6 +91,9 @@ const voiceStreamStartTimes = new Map();
 const activeMinesGames = new Map();
 const activeBlackjackGames = new Map();
 const activeBlackjackPvPGames = new Map();
+const activeBlackjackPvPChallenges = new Map();
+const tryoutAgreementTimers = new Map();
+const TRYOUT_AGREEMENT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const MINES_TILE_COUNT = 12;
 const MINES_MAX_BOMBS = 6;
 const PREFIX_COMMAND_ALIASES = { av: 'avatar', ava: 'avatar', cv: 'cover' };
@@ -247,6 +252,7 @@ function getConfig(guildId) {
     tempVoice: {
       ...DEFAULT_CONFIG.tempVoice,
       ...(saved.tempVoice || {}),
+      owners: saved.tempVoice?.owners && typeof saved.tempVoice.owners === 'object' ? saved.tempVoice.owners : {},
     },
     ticketPanel: {
       ...DEFAULT_CONFIG.ticketPanel,
@@ -806,21 +812,20 @@ function resolveBlackjackDuel(challengerRound, targetRound) {
 }
 
 function makeBlackjackPvPComponents(session) {
-  return ['challenger', 'opponent'].map((playerKey) => {
-    const player = session.players[playerKey];
-    return new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`pvpblackjack:${session.id}:${playerKey}:hit`)
-        .setLabel('+ Card')
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(session.ended || player.stood),
-      new ButtonBuilder()
-        .setCustomId(`pvpblackjack:${session.id}:${playerKey}:stand`)
-        .setLabel('- Card')
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(session.ended || player.stood),
-    );
-  });
+  if (session.ended) return [];
+  return ['challenger', 'opponent']
+    .map((playerKey) => {
+      return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`pvpblackjack:${session.id}:${playerKey}:hit`)
+          .setLabel('+')
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`pvpblackjack:${session.id}:${playerKey}:stand`)
+          .setLabel('-')
+          .setStyle(ButtonStyle.Danger),
+      );
+    });
 }
 
 function getBlackjackPvPPayload(session) {
@@ -841,7 +846,7 @@ function getBlackjackPvPPayload(session) {
     lines.push(session.result);
   } else {
     const playing = [challenger, opponent].filter((player) => !player.stood).map((player) => `<@${player.id}>`);
-    lines.push(`Use your **+ Card** button to hit or **- Card** to stand. Waiting for: ${playing.join(' and ')}.`);
+    lines.push(`Use **+** to hit or **-** to stand. Waiting for: ${playing.join(' and ')}.`);
   }
 
   return { content: lines.join('\n'), components: makeBlackjackPvPComponents(session) };
@@ -969,6 +974,147 @@ async function startBlackjackPvPGame(guildId, challengerId, opponentId, bet, sen
   }
 }
 
+async function createBlackjackPvPChallenge(guildId, challengerId, opponentId, bet, sendChallengeMessage) {
+  const hasActiveGame = (userId) =>
+    [...activeBlackjackPvPGames.values()].some((game) =>
+      game.guildId === guildId && Object.values(game.players).some((player) => player.id === userId))
+    || [...activeBlackjackGames.values()].some((game) => game.guildId === guildId && game.userId === userId);
+  const hasPendingChallenge = (userId) =>
+    [...activeBlackjackPvPChallenges.values()].some((challenge) =>
+      challenge.guildId === guildId
+      && (challenge.challengerId === userId || challenge.opponentId === userId));
+
+  if (hasActiveGame(challengerId) || hasActiveGame(opponentId)) {
+    return { error: 'One of these players already has an active blackjack game.' };
+  }
+  if (hasPendingChallenge(challengerId) || hasPendingChallenge(opponentId)) {
+    return { error: 'One of these players already has a pending blackjack challenge.' };
+  }
+
+  const config = getConfig(guildId);
+  const challengerBalance = Number.isSafeInteger(config.economy.balances[challengerId])
+    && config.economy.balances[challengerId] >= 0 ? config.economy.balances[challengerId] : 100;
+  const opponentBalance = Number.isSafeInteger(config.economy.balances[opponentId])
+    && config.economy.balances[opponentId] >= 0 ? config.economy.balances[opponentId] : 100;
+  if (bet > challengerBalance) return { error: `You only have **${challengerBalance.toLocaleString()} coins** to bet.` };
+  if (bet > opponentBalance) return { error: `Your opponent only has **${opponentBalance.toLocaleString()} coins** to bet.` };
+
+  const challenge = {
+    id: randomBytes(5).toString('hex'),
+    guildId,
+    challengerId,
+    opponentId,
+    bet,
+    status: 'pending',
+    message: null,
+    timeout: null,
+  };
+  activeBlackjackPvPChallenges.set(challenge.id, challenge);
+
+  try {
+    const buttons = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`pvpchallenge:${challenge.id}:accept`)
+        .setLabel('Accept')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`pvpchallenge:${challenge.id}:reject`)
+        .setLabel('Reject')
+        .setStyle(ButtonStyle.Secondary),
+    );
+    challenge.message = await sendChallengeMessage({
+      content: `<@${opponentId}>, <@${challengerId}> challenges you to Blackjack PvP for **${bet.toLocaleString()} coins each**. Accept or reject within 2 minutes.`,
+      components: [buttons],
+      allowedMentions: { users: [opponentId] },
+    });
+    challenge.timeout = setTimeout(() => {
+      if (challenge.status !== 'pending') return;
+      challenge.status = 'expired';
+      activeBlackjackPvPChallenges.delete(challenge.id);
+      void challenge.message.edit(makeCurrencyV2Payload({
+        content: 'This Blackjack PvP challenge expired without a response.',
+        components: [],
+        allowedMentions: { parse: [] },
+      })).catch(() => null);
+    }, 120_000);
+    challenge.timeout.unref();
+    return { challenge };
+  } catch (error) {
+    activeBlackjackPvPChallenges.delete(challenge.id);
+    throw error;
+  }
+}
+
+async function handleBlackjackPvPChallengeButton(interaction) {
+  const [, challengeId, action] = interaction.customId.split(':');
+  const challenge = activeBlackjackPvPChallenges.get(challengeId);
+  if (!challenge || challenge.status !== 'pending') {
+    await interaction.reply(makeCurrencyV2Payload('This Blackjack PvP challenge has expired.', true));
+    return;
+  }
+  if (interaction.user.id !== challenge.opponentId) {
+    await interaction.reply(makeCurrencyV2Payload('Only the invited player can accept or reject this challenge.', true));
+    return;
+  }
+  if (!['accept', 'reject'].includes(action)) {
+    await interaction.reply(makeCurrencyV2Payload('That challenge action is not available.', true));
+    return;
+  }
+
+  clearTimeout(challenge.timeout);
+  challenge.status = 'processing';
+  const endChallenge = () => activeBlackjackPvPChallenges.delete(challenge.id);
+
+  if (action === 'reject') {
+    challenge.status = 'rejected';
+    endChallenge();
+    await interaction.update(makeCurrencyV2Payload({
+      content: `<@${challenge.opponentId}> rejected <@${challenge.challengerId}>'s Blackjack PvP challenge.`,
+      components: [],
+      allowedMentions: { parse: [] },
+    }));
+    return;
+  }
+
+  try {
+    const result = await startBlackjackPvPGame(
+      challenge.guildId,
+      challenge.challengerId,
+      challenge.opponentId,
+      challenge.bet,
+      async (payload) => {
+        await interaction.update(makeCurrencyV2Payload(payload));
+        challenge.status = 'accepted';
+        endChallenge();
+        return interaction.message;
+      },
+    );
+    if (result.error) {
+      challenge.status = 'failed';
+      endChallenge();
+      await interaction.update(makeCurrencyV2Payload({
+        content: `The challenge could not start: ${result.error}`,
+        components: [],
+        allowedMentions: { parse: [] },
+      }));
+    }
+  } catch (error) {
+    console.error('Could not start accepted PvP blackjack challenge:', error.message);
+    challenge.status = 'failed';
+    endChallenge();
+    const payload = makeCurrencyV2Payload({
+      content: 'The challenge could not start. No bet was kept.',
+      components: [],
+      allowedMentions: { parse: [] },
+    });
+    if (interaction.replied || interaction.deferred) {
+      await interaction.message.edit(payload).catch(() => null);
+    } else {
+      await interaction.update(payload).catch(() => null);
+    }
+  }
+}
+
 async function handleBlackjackPvPButton(interaction) {
   const [, sessionId, playerKey, action] = interaction.customId.split(':');
   const session = activeBlackjackPvPGames.get(sessionId);
@@ -1016,11 +1162,11 @@ function makeBlackjackComponents(session) {
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`blackjack:${session.id}:hit`)
-      .setLabel('Hit')
-      .setStyle(ButtonStyle.Primary),
+      .setLabel('+')
+      .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`blackjack:${session.id}:stand`)
-      .setLabel('✕')
+      .setLabel('-')
       .setStyle(ButtonStyle.Danger),
   )];
 }
@@ -1039,7 +1185,7 @@ function getBlackjackPayload(session) {
   if (session.ended) {
     lines.push(session.result, `Balance: **${session.balance.toLocaleString()} coins**.`);
   } else {
-    lines.push('Choose **Hit** to draw a card or **✕** to stand.');
+    lines.push('Choose **+** to draw a card or **-** to stand.');
   }
 
   return { content: lines.join('\n'), components: makeBlackjackComponents(session) };
@@ -1499,15 +1645,26 @@ const commands = [
         .addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]))),
   new SlashCommandBuilder()
     .setName('autorole')
-    .setDescription('Set the role given to every new member')
+    .setDescription('Set up to two roles given to every new member')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addRoleOption((option) => option.setName('role').setDescription('Role to assign to new members').setRequired(false)),
+    .addRoleOption((option) => option.setName('role').setDescription('First role to assign').setRequired(false))
+    .addRoleOption((option) => option.setName('role2').setDescription('Second role to assign').setRequired(false)),
   new SlashCommandBuilder()
     .setName('role')
     .setDescription('Give a role to a server member')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles)
     .addStringOption((option) => option.setName('user').setDescription('User mention or ID').setRequired(true))
     .addStringOption((option) => option.setName('role').setDescription('Role name, mention, or ID').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('roleall')
+    .setDescription('Give a role to all human members in the server')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles)
+    .addRoleOption((option) => option.setName('role').setDescription('Role to assign to human members').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('purge')
+    .setDescription('Delete recent user and bot messages from this channel')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .addIntegerOption((option) => option.setName('amount').setDescription('Number of recent messages to delete (1-300)').setMinValue(1).setMaxValue(300).setRequired(true)),
   new SlashCommandBuilder()
     .setName('whitelist')
     .setDescription('Manage anti-nuke exemptions and roles allowed to post external invite links')
@@ -1726,7 +1883,43 @@ function buildTicketPanelComponents() {
   );
 }
 
-async function sendTicketTranscript(guild, channel, closerUser) {
+function clearTryoutAgreementTimeout(channelId) {
+  const timeout = tryoutAgreementTimers.get(channelId);
+  if (timeout) clearTimeout(timeout);
+  tryoutAgreementTimers.delete(channelId);
+}
+
+function scheduleTryoutAgreementTimeout(channel) {
+  clearTryoutAgreementTimeout(channel.id);
+  const ownerMatch = String(channel.topic || '').match(/ticket-owner:(\d+)/);
+  const ownerId = ownerMatch?.[1];
+  if (!ownerId || !channel.topic?.includes('tryout-agreed:no')) return;
+
+  const ownerOverwrite = channel.permissionOverwrites.cache.get(ownerId);
+  if (ownerOverwrite?.allow.has(PermissionFlagsBits.SendMessages)) return;
+
+  const timeout = setTimeout(async () => {
+    tryoutAgreementTimers.delete(channel.id);
+    const ticket = channel.guild.channels.cache.get(channel.id)
+      || await channel.guild.channels.fetch(channel.id).catch(() => null);
+    if (!ticket || !ticket.topic?.includes('tryout-agreed:no')) return;
+
+    const currentOwnerId = String(ticket.topic).match(/ticket-owner:(\d+)/)?.[1];
+    if (!currentOwnerId) return;
+    if (ticket.permissionOverwrites.cache.get(currentOwnerId)?.allow.has(PermissionFlagsBits.SendMessages)) return;
+
+    await sendTicketTranscript(ticket.guild, ticket, null, 'Ghosting Tix').catch((error) => {
+      console.error(`Could not save Ghosting Tix transcript for ${ticket.id}:`, error.message);
+    });
+    await ticket.delete('Ghosting Tix').catch((error) => {
+      console.error(`Could not close Ghosting Tix ticket ${ticket.id}:`, error.message);
+    });
+  }, Math.max(0, channel.createdTimestamp + TRYOUT_AGREEMENT_TIMEOUT_MS - Date.now()));
+  timeout.unref();
+  tryoutAgreementTimers.set(channel.id, timeout);
+}
+
+async function sendTicketTranscript(guild, channel, closerUser, closeReason = 'No reason provided') {
   const config = getConfig(guild.id);
   if (!config.transcriptChannelId) return;
 
@@ -1748,7 +1941,7 @@ async function sendTicketTranscript(guild, channel, closerUser) {
       { name: 'Open Time', value: `<t:${openTimestamp}:f>`, inline: true },
       { name: 'Closed Time', value: `<t:${closeTimestamp}:f>`, inline: true },
       { name: 'Claimed By', value: 'Unclaimed', inline: true },
-      { name: 'Reason', value: 'No reason provided', inline: true },
+      { name: 'Reason', value: closeReason, inline: true },
     )
     .setFooter({ text: `Ticket: ${channel.name}` });
 
@@ -1756,6 +1949,7 @@ async function sendTicketTranscript(guild, channel, closerUser) {
 }
 
 async function createTicketChannel(guild, user, type) {
+  const isTryout = type === 'tryout';
   const config = getConfig(guild.id);
   const staffRoleIds = [
     config.ownerRoleId,
@@ -1765,30 +1959,54 @@ async function createTicketChannel(guild, user, type) {
   ].filter(Boolean);
 
   const channelName = `${type}-${user.username}`.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').slice(0, 80);
+  const ownerPermissions = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory];
+  if (!isTryout) ownerPermissions.push(PermissionFlagsBits.SendMessages);
   const channel = await guild.channels.create({
     name: channelName,
     type: ChannelType.GuildText,
     parent: config.ticketCategoryId || guild.channels.cache.find((candidate) => candidate.type === ChannelType.GuildCategory && candidate.name.toLowerCase().includes('ticket'))?.id || undefined,
     permissionOverwrites: [
       { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
-      { id: user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+      {
+        id: user.id,
+        allow: ownerPermissions,
+        deny: isTryout ? [PermissionFlagsBits.SendMessages] : [],
+      },
       ...staffRoleIds.map((roleId) => ({
         id: roleId,
         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
       })),
     ],
-    topic: `ticket-owner:${user.id}`,
+    topic: `ticket-owner:${user.id};ticket-type:${type}${isTryout ? ';tryout-agreed:no' : ''}`,
   });
+
+  if (isTryout) scheduleTryoutAgreementTimeout(channel);
 
   const closeButton = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`ticket:close:${channel.id}`).setLabel('Close Ticket').setStyle(ButtonStyle.Danger),
   );
 
   await channel.send({
-    content: `Ticket opened by ${user}. Staff can reply here and close this ticket.`,
+    content: isTryout
+      ? `Tryout ticket opened by ${user}. Agree to the rules before sending messages here.`
+      : `Ticket opened by ${user}. Staff can reply here and close this ticket.`,
     components: [closeButton],
     allowedMentions: { parse: ['users'] },
   });
+
+  if (isTryout) {
+    const agreeButton = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`ticket:agree:${channel.id}`)
+        .setLabel('Agree')
+        .setStyle(ButtonStyle.Secondary),
+    );
+    await channel.send(makeCurrencyV2Payload({
+      content: '**TRY OUT RULES : READ CAREFULLY!!**\n› NO ARMOR UNTIL 5 ROUNDS\n› YES BANDAGE UNLI USAGE\n› CAMPING IS AUTOMATICALLY LOSE\n› TRYOUT WILL RACE TO 5\n-# wait for tryout handler to handle you',
+      components: [agreeButton],
+      allowedMentions: { parse: [] },
+    }));
+  }
 
   return channel;
 }
@@ -1807,6 +2025,41 @@ async function setupTicketPanel(guild, channel) {
   saveConfig(guild.id, config);
 
   return message;
+}
+
+function getTempVoiceOwnerId(channel) {
+  const storedOwnerId = getConfig(channel.guild.id).tempVoice.owners[channel.id];
+  if (storedOwnerId) return storedOwnerId;
+
+  const ownerOverwrite = channel.permissionOverwrites.cache.find((overwrite) =>
+    overwrite.id !== client.user?.id
+    && !channel.guild.roles.cache.has(overwrite.id)
+    && overwrite.allow.has(PermissionFlagsBits.ManageChannels));
+  return ownerOverwrite?.id || null;
+}
+
+function saveTempVoiceOwner(channel, ownerId) {
+  tempVoiceOwners.set(channel.id, ownerId);
+  const config = getConfig(channel.guild.id);
+  config.tempVoice.owners[channel.id] = ownerId;
+  saveConfig(channel.guild.id, config);
+}
+
+async function fetchTemporaryVoiceChannel(channelId) {
+  const channel = client.channels.cache.get(channelId)
+    || await client.channels.fetch(channelId).catch(() => null);
+  return channel?.type === ChannelType.GuildVoice ? channel : null;
+}
+
+async function fetchTemporaryVoiceMember(guild, userId) {
+  return guild.members.cache.get(userId) || await guild.members.fetch(userId).catch(() => null);
+}
+
+function removeTempVoiceOwner(channel) {
+  tempVoiceOwners.delete(channel.id);
+  const config = getConfig(channel.guild.id);
+  delete config.tempVoice.owners[channel.id];
+  saveConfig(channel.guild.id, config);
 }
 
 function makeTempVoiceControls(channel, owner) {
@@ -1892,9 +2145,59 @@ client.once(Events.ClientReady, async (readyClient) => {
   } catch (error) {
     console.error('Could not register slash commands after login:', error.message);
   }
+
+  for (const guild of readyClient.guilds.cache.values()) {
+    const channels = await guild.channels.fetch().catch((error) => {
+      console.error(`Could not restore tryout ticket timers for ${guild.id}:`, error.message);
+      return null;
+    });
+    for (const channel of channels?.values() || []) {
+      if (channel.topic?.includes('ticket-type:tryout;tryout-agreed:no')) {
+        scheduleTryoutAgreementTimeout(channel);
+      }
+    }
+  }
 });
 
 async function handleInteraction(interaction) {
+  if (interaction.isButton() && interaction.customId.startsWith('ticket:agree:')) {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'Tryout agreements only work in a server.', ephemeral: true });
+      return;
+    }
+
+    const channelId = interaction.customId.split(':')[2];
+    const channel = interaction.guild.channels.cache.get(channelId)
+      || await interaction.guild.channels.fetch(channelId).catch(() => null);
+    const ownerId = String(channel?.topic || '').match(/ticket-owner:(\d+)/)?.[1];
+    if (!channel || channel.id !== interaction.channelId
+      || !channel.topic?.includes('ticket-type:tryout;tryout-agreed:no') || !ownerId) {
+      await interaction.reply({ content: 'This tryout agreement is no longer active.', ephemeral: true });
+      return;
+    }
+    if (interaction.user.id !== ownerId) {
+      await interaction.reply({ content: 'Only the ticket owner can agree to the tryout rules.', ephemeral: true });
+      return;
+    }
+
+    try {
+      await channel.permissionOverwrites.edit(ownerId, { SendMessages: true }, 'Tryout rules accepted by ticket owner');
+      await channel.setTopic(String(channel.topic).replace('tryout-agreed:no', 'tryout-agreed:yes'), 'Tryout rules accepted');
+      clearTryoutAgreementTimeout(channel.id);
+      await interaction.update(makeCurrencyV2Payload({
+        content: `<@${ownerId}> agreed to the tryout rules. You can now send messages in this ticket.`,
+        components: [],
+        allowedMentions: { parse: [] },
+      }));
+    } catch (error) {
+      console.error(`Could not accept tryout rules in ${channel.id}:`, error.message);
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: 'I could not enable messaging in this ticket. Please contact staff.', ephemeral: true }).catch(() => null);
+      }
+    }
+    return;
+  }
+
   if (interaction.isButton() && interaction.customId.startsWith('ticket:close:')) {
     if (!interaction.guild) {
       await interaction.reply({ content: 'Tickets can only be closed in a server.', ephemeral: true });
@@ -2043,6 +2346,18 @@ async function handleInteraction(interaction) {
     return;
   }
 
+  if (interaction.isButton() && interaction.customId.startsWith('pvpchallenge:')) {
+    try {
+      await handleBlackjackPvPChallengeButton(interaction);
+    } catch (error) {
+      console.error('Could not process PvP blackjack challenge:', error.message);
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply(makeCurrencyV2Payload('Could not process this Blackjack PvP challenge.', true)).catch(() => null);
+      }
+    }
+    return;
+  }
+
   if (interaction.isButton() && interaction.customId.startsWith('pvpblackjack:')) {
     try {
       await handleBlackjackPvPButton(interaction);
@@ -2055,28 +2370,76 @@ async function handleInteraction(interaction) {
     return;
   }
 
-  if (interaction.isButton() && interaction.customId.startsWith('tempvoice:')) {
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('tempvoice-modal:')) {
     const [, action, channelId] = interaction.customId.split(':');
-    const channel = interaction.guild.channels.cache.get(channelId) || await interaction.guild.channels.fetch(channelId).catch(() => null);
+    const channel = await fetchTemporaryVoiceChannel(channelId);
     if (!channel) {
       await interaction.reply({ content: 'This temporary voice room no longer exists.', ephemeral: true });
       return;
     }
 
-    const ownerOverwrite = channel.permissionOverwrites.cache.find((overwrite) =>
-      !interaction.guild.roles.cache.has(overwrite.id) && overwrite.allow.has(PermissionFlagsBits.ManageChannels));
-    const ownerId = tempVoiceOwners.get(channel.id) || ownerOverwrite?.id || null;
-    const isOwner = interaction.user.id === ownerId || interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
-    const isInRoom = interaction.member.voice?.channelId === channel.id;
+    const ownerId = tempVoiceOwners.get(channel.id) || getTempVoiceOwnerId(channel);
+    const member = await fetchTemporaryVoiceMember(channel.guild, interaction.user.id);
+    const isOwner = interaction.user.id === ownerId || member?.permissions.has(PermissionFlagsBits.Administrator);
+    if (!isOwner) {
+      await interaction.reply({ content: 'Only the room owner or a server administrator can change these settings.', ephemeral: true });
+      return;
+    }
+
+    try {
+      if (action === 'rename') {
+        const name = interaction.fields.getTextInputValue('roomName').trim();
+        if (!name || name.length > 100) {
+          await interaction.reply({ content: 'Room names must be between 1 and 100 characters.', ephemeral: true });
+          return;
+        }
+        await channel.setName(name, `Temporary voice room renamed by ${interaction.user.tag}`);
+        await interaction.reply({ content: `Room renamed to ${name}.`, ephemeral: true });
+        return;
+      }
+
+      if (action === 'limit') {
+        const rawLimit = interaction.fields.getTextInputValue('userLimit').trim();
+        if (!/^\d{1,2}$/.test(rawLimit) || Number(rawLimit) > 99) {
+          await interaction.reply({ content: 'Enter a whole number from 0 to 99. Use 0 for unlimited.', ephemeral: true });
+          return;
+        }
+        const limit = Number(rawLimit);
+        await channel.setUserLimit(limit, `Temporary voice room limit set by ${interaction.user.tag}`);
+        await interaction.reply({ content: `User limit set to ${limit === 0 ? 'unlimited' : limit}.`, ephemeral: true });
+        return;
+      }
+
+      await interaction.reply({ content: 'That temporary voice form is not supported.', ephemeral: true });
+    } catch (error) {
+      console.error(`Could not update temporary voice room ${channel.id}:`, error.message);
+      await interaction.reply({ content: 'I could not update that room. Check my permissions and try again.', ephemeral: true }).catch(() => null);
+    }
+    return;
+  }
+
+  if (interaction.isButton() && interaction.customId.startsWith('tempvoice:')) {
+    const [, action, channelId] = interaction.customId.split(':');
+    const channel = await fetchTemporaryVoiceChannel(channelId);
+    if (!channel) {
+      await interaction.reply({ content: 'This temporary voice room no longer exists.', ephemeral: true });
+      return;
+    }
+
+    const guild = channel.guild;
+    const member = await fetchTemporaryVoiceMember(guild, interaction.user.id);
+    const ownerId = tempVoiceOwners.get(channel.id) || getTempVoiceOwnerId(channel);
+    const isOwner = interaction.user.id === ownerId || member?.permissions.has(PermissionFlagsBits.Administrator);
+    const isInRoom = member?.voice.channelId === channel.id;
 
     if (action === 'lock' || action === 'unlock') {
       if (!isOwner) {
         await interaction.reply({ content: 'Only the room owner or a server administrator can lock or unlock this room.', ephemeral: true });
         return;
       }
-      await channel.permissionOverwrites.edit(interaction.guild.roles.everyone, {
-        Connect: action === 'lock' ? false : null,
-      });
+      await channel.permissionOverwrites.edit(guild.roles.everyone, {
+        Connect: action === 'lock' ? false : true,
+      }, `Temporary voice room ${action}ed by ${interaction.user.tag}`);
       await interaction.reply({ content: action === 'lock' ? 'Voice room locked.' : 'Voice room unlocked.', ephemeral: true });
       return;
     }
@@ -2087,12 +2450,12 @@ async function handleInteraction(interaction) {
     }
 
     if (action === 'hide') {
-      await channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { ViewChannel: false });
+      await channel.permissionOverwrites.edit(guild.roles.everyone, { ViewChannel: false });
       await interaction.reply({ content: 'Voice room hidden.', ephemeral: true });
       return;
     }
     if (action === 'show') {
-      await channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { ViewChannel: true });
+      await channel.permissionOverwrites.edit(guild.roles.everyone, { ViewChannel: true });
       await interaction.reply({ content: 'Voice room visible.', ephemeral: true });
       return;
     }
@@ -2101,24 +2464,53 @@ async function handleInteraction(interaction) {
         await interaction.reply({ content: 'Only the room owner can claim this room.', ephemeral: true });
         return;
       }
-      tempVoiceOwners.set(channel.id, interaction.user.id);
+      saveTempVoiceOwner(channel, interaction.user.id);
       await interaction.reply({ content: 'You are now the owner of this room.', ephemeral: true });
       return;
     }
     if (action === 'rename') {
-      const name = `${interaction.user.username}'s room`;
-      await channel.setName(name);
-      await interaction.reply({ content: `Room renamed to ${name}.`, ephemeral: true });
+      if (!isOwner) {
+        await interaction.reply({ content: 'Only the room owner can rename this room.', ephemeral: true });
+        return;
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`tempvoice-modal:rename:${channel.id}`)
+        .setTitle('Rename temporary room');
+      const roomName = new TextInputBuilder()
+        .setCustomId('roomName')
+        .setLabel('What should the room be called?')
+        .setStyle(TextInputStyle.Short)
+        .setMinLength(1)
+        .setMaxLength(100)
+        .setPlaceholder(channel.name)
+        .setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(roomName));
+      await interaction.showModal(modal);
       return;
     }
     if (action === 'limit') {
-      const limit = channel.userLimit === 0 ? 2 : 0;
-      await channel.setUserLimit(limit);
-      await interaction.reply({ content: `User limit set to ${limit === 0 ? 'unlimited' : limit}.`, ephemeral: true });
+      if (!isOwner) {
+        await interaction.reply({ content: 'Only the room owner can change the user limit.', ephemeral: true });
+        return;
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`tempvoice-modal:limit:${channel.id}`)
+        .setTitle('Set temporary room limit');
+      const userLimit = new TextInputBuilder()
+        .setCustomId('userLimit')
+        .setLabel('Maximum users (0-99; 0 is unlimited)')
+        .setStyle(TextInputStyle.Short)
+        .setMinLength(1)
+        .setMaxLength(2)
+        .setPlaceholder('0 means unlimited')
+        .setValue(String(channel.userLimit))
+        .setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(userLimit));
+      await interaction.showModal(modal);
       return;
     }
     if (action === 'info') {
-      await interaction.reply({ content: `Room: ${channel.name}\nOwner: <@${ownerId || interaction.user.id}>\nUsers: ${channel.members.size}`, ephemeral: true });
+      await interaction.reply({ content: `Room: ${channel.name}\nOwner: ${ownerId ? `<@${ownerId}>` : 'Unknown'}\nUsers: ${channel.members.size}`, ephemeral: true });
       return;
     }
     if (action === 'delete') {
@@ -2127,6 +2519,7 @@ async function handleInteraction(interaction) {
         return;
       }
       await channel.delete('Temporary voice room deleted by owner');
+      removeTempVoiceOwner(channel);
       await interaction.reply({ content: 'Room deleted.', ephemeral: true });
       return;
     }
@@ -2295,6 +2688,103 @@ async function handleInteraction(interaction) {
     return;
   }
 
+  if (interaction.commandName === 'roleall') {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+      return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageRoles)) {
+      await interaction.reply({ content: 'Manage Roles permission is required.', ephemeral: true });
+      return;
+    }
+
+    const role = interaction.options.getRole('role', true);
+    const botMember = interaction.guild.members.me;
+    if (!botMember?.permissions.has(PermissionFlagsBits.ManageRoles) || !role.editable || role.managed) {
+      await interaction.reply({ content: 'I cannot assign that role. Check my Manage Roles permission and role position.', ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+    let members;
+    try {
+      members = await interaction.guild.members.fetch();
+    } catch (error) {
+      console.error(`Could not fetch members for /roleall in ${interaction.guild.id}:`, error.message);
+      await interaction.editReply('I could not load the server members. Check that Server Members Intent is enabled.');
+      return;
+    }
+
+    const targets = [...members.values()].filter((member) => !member.user.bot && !member.roles.cache.has(role.id));
+    const skipped = members.size - targets.length;
+    let assigned = 0;
+    let failed = 0;
+    for (let start = 0; start < targets.length; start += 5) {
+      const batch = targets.slice(start, start + 5);
+      const results = await Promise.all(batch.map(async (member) => {
+        try {
+          await member.roles.add(role, `Bulk role assignment by ${interaction.user.tag}`);
+          return true;
+        } catch (error) {
+          console.error(`Could not assign role ${role.id} to human member ${member.id}:`, error.message);
+          return false;
+        }
+      }));
+      assigned += results.filter(Boolean).length;
+      failed += results.length - results.filter(Boolean).length;
+    }
+
+    await interaction.editReply(`Added **${role.name}** to ${assigned} human member(s). Skipped ${skipped} member(s) who were bots or already had the role. Failed: ${failed}.`);
+    return;
+  }
+
+  if (interaction.commandName === 'purge') {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+      return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) {
+      await interaction.reply({ content: 'Manage Messages permission is required.', ephemeral: true });
+      return;
+    }
+
+    const channel = interaction.channel;
+    const botPermissions = interaction.guild.members.me?.permissionsIn(channel);
+    if (!channel?.isTextBased?.() || typeof channel.bulkDelete !== 'function'
+      || !botPermissions?.has(PermissionFlagsBits.ManageMessages)) {
+      await interaction.reply({ content: 'I need Manage Messages permission in a text channel to purge messages.', ephemeral: true });
+      return;
+    }
+
+    const amount = interaction.options.getInteger('amount', true);
+    await interaction.deferReply({ ephemeral: true });
+    const selectedMessages = new Map();
+    let before;
+    try {
+      while (selectedMessages.size < amount) {
+        const limit = Math.min(100, amount - selectedMessages.size);
+        const page = await channel.messages.fetch({ limit, ...(before ? { before } : {}) });
+        if (!page.size) break;
+        for (const message of page.values()) selectedMessages.set(message.id, message);
+        const oldestMessage = page.last();
+        if (!oldestMessage || page.size < limit) break;
+        before = oldestMessage.id;
+      }
+
+      const messages = [...selectedMessages.values()];
+      let deletedCount = 0;
+      for (let start = 0; start < messages.length; start += 100) {
+        const deleted = await channel.bulkDelete(messages.slice(start, start + 100), true);
+        deletedCount += deleted.size;
+      }
+      await interaction.editReply(`Deleted ${deletedCount} of up to ${amount} recent messages. Messages older than 14 days are skipped by Discord.`);
+    } catch (error) {
+      console.error(`Could not purge messages in ${channel.id}:`, error.message);
+      await interaction.editReply('I could not complete the purge. Check my channel permissions and try again.');
+    }
+    return;
+  }
+
   if (interaction.commandName === 'autorole') {
     if (!interaction.guild) {
       await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
@@ -2307,9 +2797,21 @@ async function handleInteraction(interaction) {
 
     const config = getConfig(interaction.guildId);
     const role = interaction.options.getRole('role', false);
-    config.autoRoleId = role ? role.id : null;
+    const secondRole = interaction.options.getRole('role2', false);
+    if (role && secondRole && role.id === secondRole.id) {
+      await interaction.reply({ content: 'Choose two different roles.', ephemeral: true });
+      return;
+    }
+    config.autoRoleId = role?.id || null;
+    config.autoRoleId2 = secondRole?.id || null;
     saveConfig(interaction.guildId, config);
-    await interaction.reply({ content: role ? `Auto-role set to ${role.name}.` : 'Auto-role cleared.', ephemeral: true });
+    const selectedRoles = [role, secondRole].filter(Boolean);
+    await interaction.reply({
+      content: selectedRoles.length
+        ? `Auto-roles set to ${selectedRoles.map((selectedRole) => selectedRole.name).join(' and ')}.`
+        : 'Auto-roles cleared.',
+      ephemeral: true,
+    });
     return;
   }
 
@@ -2691,7 +3193,7 @@ async function handleInteraction(interaction) {
   if (interaction.commandName === 'currency') {
     const replyCurrency = (payload) => interaction.reply(makeCurrencyV2Payload(payload));
     if (!interaction.guild) {
-      await interaction.reply(makeCurrencyV2Payload('The currency game can only be played in a server.', true));
+      await replyCurrency('The currency game can only be played in a server.');
       return;
     }
 
@@ -2723,7 +3225,7 @@ async function handleInteraction(interaction) {
       const cooldown = 24 * 60 * 60 * 1000;
       if (now - lastClaim < cooldown) {
         const hours = Math.ceil((cooldown - (now - lastClaim)) / (60 * 60 * 1000));
-        await interaction.reply(makeCurrencyV2Payload(`Your next daily reward is available in about ${hours} hour${hours === 1 ? '' : 's'}.`, true));
+        await replyCurrency(`Your next daily reward is available in about ${hours} hour${hours === 1 ? '' : 's'}.`);
         return;
       }
 
@@ -2744,7 +3246,7 @@ async function handleInteraction(interaction) {
         const remainingSeconds = Math.ceil(remainingMs / 1000);
         const minutes = Math.floor(remainingSeconds / 60);
         const seconds = remainingSeconds % 60;
-        await interaction.reply(makeCurrencyV2Payload(`Cluck is on cooldown. Try again in **${minutes}m ${seconds}s**.`, true));
+        await replyCurrency(`Cluck is on cooldown. Try again in **${minutes}m ${seconds}s**.`);
         return;
       }
 
@@ -2761,7 +3263,7 @@ async function handleInteraction(interaction) {
       const amount = interaction.options.getInteger('amount', true);
       const result = adjustCurrencyBalance(interaction.guild, interaction.user, interaction.member, target, amount, subcommand);
       if (result.error) {
-        await interaction.reply(makeCurrencyV2Payload(result.error, true));
+        await replyCurrency(result.error);
       } else {
         await replyCurrency(result.content);
       }
@@ -2773,27 +3275,27 @@ async function handleInteraction(interaction) {
     if (subcommand === 'pvp') {
       const opponent = interaction.options.getUser('user', true);
       if (opponent.id === userId || opponent.bot) {
-        await interaction.reply(makeCurrencyV2Payload('You cannot challenge yourself or a bot to blackjack.', true));
+        await replyCurrency('You cannot challenge yourself or a bot to blackjack.');
         return;
       }
       if (amount < 500 || amount > 2000) {
-        await interaction.reply(makeCurrencyV2Payload('PvP blackjack bets must be between **500** and **2000** coins.', true));
+        await replyCurrency('PvP blackjack bets must be between **500** and **2000** coins.');
         return;
       }
       if (amount > balance) {
-        await interaction.reply(makeCurrencyV2Payload(`You only have **${balance.toLocaleString()} coins** to bet.`, true));
+        await replyCurrency(`You only have **${balance.toLocaleString()} coins** to bet.`);
         return;
       }
       try {
-        const result = await startBlackjackPvPGame(interaction.guildId, userId, opponent.id, amount, async (payload) => {
+        const result = await createBlackjackPvPChallenge(interaction.guildId, userId, opponent.id, amount, async (payload) => {
           await interaction.reply(makeCurrencyV2Payload(payload));
           return interaction.fetchReply();
         });
-        if (result.error) await interaction.reply(makeCurrencyV2Payload(result.error, true));
+        if (result.error) await replyCurrency(result.error);
       } catch (error) {
         console.error('Could not start PvP blackjack:', error.message);
         if (!interaction.replied) {
-          await interaction.reply(makeCurrencyV2Payload('Could not start the blackjack duel. Both bets were refunded.', true));
+          await replyCurrency('Could not send the Blackjack PvP challenge.');
         }
       }
       return;
@@ -2801,29 +3303,29 @@ async function handleInteraction(interaction) {
 
     if (subcommand === 'blackjack') {
       if (amount > balance) {
-        await interaction.reply(makeCurrencyV2Payload(`You only have **${balance.toLocaleString()} coins** to bet.`, true));
+        await replyCurrency(`You only have **${balance.toLocaleString()} coins** to bet.`);
         return;
       }
       try {
         const result = await startBlackjackGame(interaction.guildId, userId, amount, async (payload) => {
-          await interaction.reply(makeCurrencyV2Payload(payload, true));
+          await replyCurrency(payload);
           return interaction.fetchReply();
         });
-        if (result.error) await interaction.reply(makeCurrencyV2Payload(result.error, true));
+        if (result.error) await replyCurrency(result.error);
       } catch (error) {
         console.error('Could not start blackjack game:', error.message);
         if (!interaction.replied) {
-          await interaction.reply(makeCurrencyV2Payload('Could not start blackjack. Your bet was refunded.', true));
+          await replyCurrency('Could not start blackjack. Your bet was refunded.');
         }
       }
       return;
     }
     if (amount > balance) {
-      await interaction.reply(makeCurrencyV2Payload(`You only have **${balance.toLocaleString()} coins** to bet.`, true));
+      await replyCurrency(`You only have **${balance.toLocaleString()} coins** to bet.`);
       return;
     }
     if (balance + amount * (subcommand === 'slots' ? 10 : 1) > Number.MAX_SAFE_INTEGER) {
-      await interaction.reply(makeCurrencyV2Payload('Your balance is too high to safely place that bet.', true));
+      await replyCurrency('Your balance is too high to safely place that bet.');
       return;
     }
 
@@ -2854,14 +3356,14 @@ async function handleInteraction(interaction) {
       const mineCount = interaction.options.getInteger('bombs', true);
       try {
         const result = await startMinesGame(interaction.guildId, userId, amount, mineCount, async (payload) => {
-          await interaction.reply(makeCurrencyV2Payload(payload, true));
+          await replyCurrency(payload);
           return interaction.fetchReply();
         });
-        if (result.error) await interaction.reply(makeCurrencyV2Payload(result.error, true));
+        if (result.error) await replyCurrency(result.error);
       } catch (error) {
         console.error('Could not start Mines game:', error.message);
         if (!interaction.replied && !interaction.deferred) {
-          await interaction.reply(makeCurrencyV2Payload('Could not start the Mines game. Your bet was refunded.', true));
+          await replyCurrency('Could not start the Mines game. Your bet was refunded.');
         }
       }
       return;
@@ -2974,7 +3476,7 @@ async function handleInteraction(interaction) {
       `Threshold: ${config.threshold} actions in ${config.windowSeconds}s\n` +
       `Response: ${config.punishment}\n` +
       `Block new bots: ${config.blockNewBots ? 'enabled' : 'disabled'}\n` +
-      `Auto-role: ${config.autoRoleId ? `<@&${config.autoRoleId}>` : 'none'}\n` +
+      `Auto-roles: ${[config.autoRoleId, config.autoRoleId2].filter(Boolean).map((roleId) => `<@&${roleId}>`).join(', ') || 'none'}\n` +
       `Owner role: ${config.ownerRoleId ? `<@&${config.ownerRoleId}>` : 'none'}\n` +
       `Co-owner role: ${config.coOwnerRoleId ? `<@&${config.coOwnerRoleId}>` : 'none'}\n` +
       `Admin role: ${config.adminRoleId ? `<@&${config.adminRoleId}>` : 'none'}\n` +
@@ -3179,10 +3681,13 @@ client.on(Events.GuildMemberRemove, (member) => {
 client.on(Events.GuildMemberAdd, async (member) => {
   const config = getConfig(member.guild.id);
 
-  if (config.autoRoleId) {
-    const role = member.guild.roles.cache.get(config.autoRoleId) || await member.guild.roles.fetch(config.autoRoleId).catch(() => null);
-    if (role && member.guild.members.me.permissions.has(PermissionFlagsBits.ManageRoles) && role.editable) {
-      await member.roles.add(role, 'Anti-nuke: auto-role assignment').catch(() => null);
+  const autoRoleIds = [...new Set([config.autoRoleId, config.autoRoleId2].filter(Boolean))];
+  for (const roleId of autoRoleIds) {
+    const role = member.guild.roles.cache.get(roleId) || await member.guild.roles.fetch(roleId).catch(() => null);
+    if (role && member.guild.members.me?.permissions.has(PermissionFlagsBits.ManageRoles) && role.editable) {
+      await member.roles.add(role, 'Configured auto-role assignment').catch((error) => {
+        console.error(`Could not auto-assign role ${role.id} to ${member.id}:`, error.message);
+      });
     }
   }
 
@@ -3263,9 +3768,23 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     }
   }
 
-  if (!newState.channel || oldState.channelId === newState.channelId) return;
   const config = getConfig(guild.id);
   const tempVoice = config.tempVoice || {};
+
+  if (oldState.channel && oldState.channelId !== newState.channelId
+    && oldState.channel.id !== tempVoice.createChannelId
+    && oldState.channel.parentId === tempVoice.categoryId
+    && getTempVoiceOwnerId(oldState.channel)
+    && oldState.channel.members.size === 0) {
+    try {
+      await oldState.channel.delete('Temporary voice room became empty');
+      removeTempVoiceOwner(oldState.channel);
+    } catch (error) {
+      console.error(`Could not delete empty temporary voice room ${oldState.channel.id}:`, error.message);
+    }
+  }
+
+  if (!newState.channel || oldState.channelId === newState.channelId) return;
 
   if (!tempVoice.categoryId || !tempVoice.createChannelId || newState.channelId !== tempVoice.createChannelId) return;
   if (newState.member?.user.bot) return;
@@ -3296,7 +3815,7 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
       ],
     });
 
-    tempVoiceOwners.set(channel.id, ownerId);
+    saveTempVoiceOwner(channel, ownerId);
     let moveFailed = false;
     try {
       await newState.member.voice.setChannel(channel);
@@ -3495,6 +4014,11 @@ async function parsePrefixCommand(message, input) {
 
 async function dispatchPrefixCommand(message, parsed) {
   const { commandName, subcommand, values, schemas } = parsed;
+  const repliedUser = ['avatar', 'cover'].includes(commandName)
+    && !values.has('user')
+    && message.reference
+    ? await message.fetchReference().then((reference) => reference.author).catch(() => null)
+    : null;
   let responseMessage;
   const optionGetter = (expectedType) => (name) => {
     const value = values.get(name);
@@ -3524,7 +4048,7 @@ async function dispatchPrefixCommand(message, parsed) {
       getInteger: optionGetter(4),
       getNumber: optionGetter(10),
       getBoolean: optionGetter(5),
-      getUser: optionGetter(6),
+      getUser: (name) => optionGetter(6)(name) ?? (name === 'user' ? repliedUser : null),
       getChannel: optionGetter(7),
       getRole: optionGetter(8),
     },
@@ -3783,11 +4307,11 @@ client.on(Events.MessageCreate, async (message) => {
           return;
         }
         try {
-          const result = await startBlackjackPvPGame(message.guild.id, userId, targetUser.id, amount, (payload) => replyCurrency(payload));
+          const result = await createBlackjackPvPChallenge(message.guild.id, userId, targetUser.id, amount, (payload) => replyCurrency(payload));
           if (result.error) await replyCurrency(result.error);
         } catch (error) {
-          console.error('Could not start PvP blackjack:', error.message);
-          await replyCurrency('Could not start the blackjack duel. Both bets were refunded.');
+          console.error('Could not send PvP blackjack challenge:', error.message);
+          await replyCurrency('Could not send the Blackjack PvP challenge.');
         }
         return;
       }

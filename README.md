@@ -89,6 +89,17 @@ priority; ambiguous partial names require more characters. The command requires
 Manage Roles, and the bot must be above the target role and member in the role
 hierarchy.
 
+Use `/roleall role` to assign a role to all human members in the server; bot
+accounts and members who already have that role are skipped. This requires
+Manage Roles for both the caller and bot. Use `/purge amount` to delete up to
+300 recent messages, including messages authored by bots and users. It requires
+Manage Messages, and Discord skips messages older than 14 days.
+
+Use `/autorole` to configure up to two roles for new members. Set `role` and
+`role2` to assign both; either option can be left empty to use one role. Run
+`/autorole` with neither option to clear auto-role assignment. The bot needs
+Manage Roles and must be above both configured roles.
+
 Use `/autoresponder add` with a trigger and response to create an automatic
 reply, `/autoresponder remove` to delete a trigger, and `/autoresponder list` to
 view configured triggers. Matching is case-insensitive; if multiple triggers
