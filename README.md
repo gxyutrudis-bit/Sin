@@ -32,7 +32,11 @@ Use `/antinuke status`, `/antinuke enable`, `/antinuke disable`,
 `/antinuke whitelist-add` and `/antinuke whitelist-remove` in Discord. These commands are restricted to
 server administrators. Configuration is saved in `data/config.json`.
 `/antinuke logs` shows the latest 10 recorded detections and their outcomes;
-up to 25 entries per server are retained across bot restarts.
+up to 25 entries per server are retained across bot restarts. Use
+`/antinuke logs channel` to send new detections to a channel, or
+`/antinuke logs clear:true` to remove that destination. The bot needs View
+Channel and Send Messages in the selected channel. Omitting both options keeps
+showing recent detections.
 Use `/action logs` with a channel to configure V2 logs for created invites,
 emojis, stickers, channels and voice channels, added roles, and deleted roles.
 Leave the channel option empty to clear it. The bot needs View Channel and Send
@@ -48,7 +52,9 @@ Use `/enable` and `/disable` to turn external Discord invite blocking on or
 off. While enabled, only members with a role added through `/whitelist role`
 can post invites to other servers; messages containing those invites are
 deleted. Use `/whitelist role` to add or remove an allowed role. Invites to the
-current server remain allowed.
+current server remain allowed. The bot needs **Manage Messages** in channels
+where it should remove invites; use `/enable` to turn blocking back on if it was
+previously disabled.
 Use `/antiscam enable`, `/antiscam disable`, and `/antiscam status` to manage
 scam and crypto-scam image detection. `/antiscam logs-channel` sets the
 destination for detection reports; leave its channel option empty to clear it.
@@ -105,6 +111,7 @@ reply, `/autoresponder remove` to delete a trigger, and `/autoresponder list` to
 view configured triggers. Matching is case-insensitive; if multiple triggers
 match a message, only the longest trigger responds. Administrators can configure
 up to 50 triggers per server. Message Content Intent must be enabled.
+Configured prefix commands do not trigger autoresponders.
 Welcome embeds configured with `/edit-embed` support `{user.id}`, `{user.name}`,
 `{user.tag}`, `{user.avatar}`, `{server.name}`, `{server.icon}`, and
 `{member.count}`; `{user}` inserts a mention.
@@ -129,9 +136,11 @@ separate per server and persist across bot restarts; coins have no real-world
 value. `/currency pvp` starts a blackjack duel; each player uses **+ Card** to
 hit and **- Card** to stand.
 Both bets are held until the duel ends, and unplayed hands stand automatically
-after two minutes. Currency command results and interactive game boards are
-sent in Discord Components V2 containers. Autoresponder configuration replies
-and triggered auto-replies also use V2 containers.
+after 10 minutes; PvP challenges also expire after 10 minutes. Blackjack and
+Mines games time out after 10 minutes of play. Slots resolve immediately and do
+not have an expiration timer. Currency command results and interactive game
+boards are sent in Discord Components V2 containers. Autoresponder configuration
+replies and triggered auto-replies also use V2 containers.
 
 ## Limits
 

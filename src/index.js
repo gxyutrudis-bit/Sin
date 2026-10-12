@@ -46,6 +46,7 @@ const DEFAULT_CONFIG = {
   imageLogChannelId: null,
   videoLogChannelId: null,
   actionLogChannelId: null,
+  antinukeLogChannelId: null,
   voiceLogChannelId: null,
   messageLogChannelId: null,
   threshold: 1,
@@ -94,10 +95,29 @@ const activeBlackjackPvPGames = new Map();
 const activeBlackjackPvPChallenges = new Map();
 const tryoutAgreementTimers = new Map();
 const TRYOUT_AGREEMENT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const CURRENCY_GAME_TIMEOUT_MS = 10 * 60 * 1000;
+const processedCommandEvents = new Map();
+const COMMAND_EVENT_DEDUPE_TTL_MS = 15 * 60 * 1000;
 const MINES_TILE_COUNT = 12;
 const MINES_MAX_BOMBS = 6;
 const PREFIX_COMMAND_ALIASES = { av: 'avatar', ava: 'avatar', cv: 'cover' };
 const PREFIX_COMMAND_NAMES = new Set(['afk', 'avatar', 'cover', 'currency', 'role']);
+
+function claimCommandEvent(eventKey) {
+  const now = Date.now();
+  for (const [key, timestamp] of processedCommandEvents) {
+    if (now - timestamp <= COMMAND_EVENT_DEDUPE_TTL_MS) break;
+    processedCommandEvents.delete(key);
+  }
+  if (processedCommandEvents.has(eventKey)) return false;
+
+  processedCommandEvents.set(eventKey, now);
+  if (processedCommandEvents.size > 10_000) {
+    const oldestKey = processedCommandEvents.keys().next().value;
+    processedCommandEvents.delete(oldestKey);
+  }
+  return true;
+}
 
 function makeCurrencyV2Payload(payload, ephemeral = false) {
   const message = typeof payload === 'string' ? { content: payload } : payload;
@@ -264,6 +284,7 @@ function getConfig(guildId) {
     imageLogChannelId: saved.imageLogChannelId || null,
     videoLogChannelId: saved.videoLogChannelId || null,
     actionLogChannelId: saved.actionLogChannelId || null,
+    antinukeLogChannelId: saved.antinukeLogChannelId || null,
     voiceLogChannelId: saved.voiceLogChannelId || null,
     messageLogChannelId: saved.messageLogChannelId || null,
     externalInviteBlockingEnabled: typeof saved.externalInviteBlockingEnabled === 'boolean'
@@ -295,6 +316,41 @@ function recordAntinukeLog(guildId, entry) {
   config.antinukeLogs.unshift(entry);
   config.antinukeLogs = config.antinukeLogs.slice(0, 25);
   saveConfig(guildId, config);
+  void sendAntinukeLog(guildId, entry);
+}
+
+async function sendAntinukeLog(guildId, entry) {
+  const channelId = getConfig(guildId).antinukeLogChannelId;
+  if (!channelId) return;
+
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) {
+    console.error(`Could not send anti-nuke log for ${guildId}: guild is unavailable.`);
+    return;
+  }
+
+  try {
+    const channel = guild.channels.cache.get(channelId)
+      || await guild.channels.fetch(channelId).catch((error) => {
+        console.error(`Could not fetch anti-nuke log channel ${channelId} in ${guild.name}:`, error);
+        return null;
+      });
+    if (!channel?.isTextBased()) {
+      console.error(`Configured anti-nuke log channel ${channelId} is unavailable or not text-based in ${guild.name}.`);
+      return;
+    }
+    const content = [
+      '## Anti-nuke detection',
+      `Action: ${entry.action}`,
+      `Executor: <@${entry.executorId}>`,
+      `Count: ${entry.actionCount}/${entry.threshold}`,
+      `Outcome: ${entry.outcome}`,
+      `Time: <t:${Math.floor(Date.parse(entry.timestamp) / 1000)}:F>`,
+    ].join('\n');
+    await channel.send(makeCurrencyV2Payload({ content, allowedMentions: { parse: [] } }));
+  } catch (error) {
+    console.error(`Could not send anti-nuke log to ${channelId} in ${guild.name}:`, error);
+  }
 }
 
 function findRoleByName(guild, name) {
@@ -383,15 +439,15 @@ function hasTicketStaffRole(guild, member, config) {
 }
 
 function extractDiscordInviteCodes(text) {
-  const invitePattern = /(?:https?:\/\/)?(?:discord(?:app)?\.(?:gg|com\/invite)|discord\.gg|discordapp\.com\/invite)\/([A-Za-z0-9-]+)/gi;
+  const invitePattern = /(?:https?:\/\/)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com\/invite)\/([A-Za-z0-9-]+)/gi;
   return [...text.matchAll(invitePattern)].map((match) => match[1].toLowerCase());
 }
 
 async function isInviteForGuild(guild, inviteCode) {
   if (!inviteCode) return false;
   try {
-    const guildInvites = await guild.invites.fetch();
-    return guildInvites.some((invite) => invite.code?.toLowerCase() === inviteCode.toLowerCase());
+    const invite = await client.fetchInvite(inviteCode);
+    return invite.guildId === guild.id;
   } catch (error) {
     console.error(`Could not check whether invite ${inviteCode} belongs to ${guild.name} (${guild.id}):`, error.message);
     return false;
@@ -813,7 +869,7 @@ function resolveBlackjackDuel(challengerRound, targetRound) {
 
 function makeBlackjackPvPComponents(session) {
   if (session.ended) return [];
-  return ['challenger', 'opponent']
+  return ['opponent', 'challenger']
     .map((playerKey) => {
       return new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -958,7 +1014,7 @@ async function startBlackjackPvPGame(guildId, challengerId, opponentId, bet, sen
   try {
     session.message = await sendGameMessage(getBlackjackPvPPayload(session));
     if (!session.ended) {
-      session.timeout = setTimeout(() => void expireBlackjackPvPGame(session), 120_000);
+      session.timeout = setTimeout(() => void expireBlackjackPvPGame(session), CURRENCY_GAME_TIMEOUT_MS);
       session.timeout.unref();
     }
     return { session };
@@ -1023,7 +1079,7 @@ async function createBlackjackPvPChallenge(guildId, challengerId, opponentId, be
         .setStyle(ButtonStyle.Secondary),
     );
     challenge.message = await sendChallengeMessage({
-      content: `<@${opponentId}>, <@${challengerId}> challenges you to Blackjack PvP for **${bet.toLocaleString()} coins each**. Accept or reject within 2 minutes.`,
+      content: `<@${opponentId}>, <@${challengerId}> challenges you to Blackjack PvP for **${bet.toLocaleString()} coins each**. Accept or reject within 10 minutes.`,
       components: [buttons],
       allowedMentions: { users: [opponentId] },
     });
@@ -1036,7 +1092,7 @@ async function createBlackjackPvPChallenge(guildId, challengerId, opponentId, be
         components: [],
         allowedMentions: { parse: [] },
       })).catch(() => null);
-    }, 120_000);
+    }, CURRENCY_GAME_TIMEOUT_MS);
     challenge.timeout.unref();
     return { challenge };
   } catch (error) {
@@ -1296,7 +1352,7 @@ async function startBlackjackGame(guildId, userId, bet, sendGameMessage) {
   try {
     session.message = await sendGameMessage(getBlackjackPayload(session));
     if (!session.ended) {
-      session.timeout = setTimeout(() => void expireBlackjackGame(session), 120_000);
+      session.timeout = setTimeout(() => void expireBlackjackGame(session), CURRENCY_GAME_TIMEOUT_MS);
       session.timeout.unref();
     }
     return { session };
@@ -1503,7 +1559,7 @@ async function startMinesGame(guildId, userId, bet, mineCount, sendGameMessage) 
         return;
       }
       await expireMinesGame(session);
-    }, 120_000);
+    }, CURRENCY_GAME_TIMEOUT_MS);
     session.timeout.unref();
     return { session };
   } catch (error) {
@@ -1543,7 +1599,16 @@ const commands = [
     .setDescription('Configure anti-nuke protection')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addSubcommand((command) => command.setName('status').setDescription('Show protection settings'))
-    .addSubcommand((command) => command.setName('logs').setDescription('Show recent anti-nuke detections and responses'))
+    .addSubcommand((command) => command
+      .setName('logs')
+      .setDescription('Show recent detections or configure the anti-nuke log channel')
+      .addChannelOption((option) => option
+        .setName('channel')
+        .setDescription('Channel for anti-nuke logs; omit to view recent detections')
+        .addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]))
+      .addBooleanOption((option) => option
+        .setName('clear')
+        .setDescription('Clear the configured anti-nuke log channel')))
     .addSubcommand((command) => command.setName('enable').setDescription('Enable protection'))
     .addSubcommand((command) => command.setName('disable').setDescription('Disable protection'))
     .addSubcommand((command) => command
@@ -2227,9 +2292,13 @@ async function handleInteraction(interaction) {
     }
 
     await sendTicketTranscript(interaction.guild, channel, interaction.user);
-    await channel.delete('Ticket closed by staff member').catch(async () => {
+    try {
+      await channel.delete('Ticket closed by staff member');
+    } catch (error) {
+      console.error(`Could not close ticket ${channel.id}:`, error);
       await interaction.reply({ content: 'I could not close that ticket. Please check my permissions.', ephemeral: true });
-    });
+      return;
+    }
 
     await interaction.reply({ content: 'Ticket closed.', ephemeral: true });
     return;
@@ -3481,12 +3550,33 @@ async function handleInteraction(interaction) {
       `Co-owner role: ${config.coOwnerRoleId ? `<@&${config.coOwnerRoleId}>` : 'none'}\n` +
       `Admin role: ${config.adminRoleId ? `<@&${config.adminRoleId}>` : 'none'}\n` +
       `PSM role: ${config.psmRoleId ? `<@&${config.psmRoleId}>` : 'none'}\n` +
-      `Whitelisted users: ${config.whitelist.length}`;
+      `Whitelisted users: ${config.whitelist.length}\n` +
+      `Anti-nuke log channel: ${config.antinukeLogChannelId ? `<#${config.antinukeLogChannelId}>` : 'not set'}`;
   } else if (subcommand === 'logs') {
-    const entries = config.antinukeLogs.slice(0, 10);
-    response = entries.length
-      ? entries.map((entry) => `<t:${Math.floor(Date.parse(entry.timestamp) / 1000)}:R> <@${entry.executorId}> — ${entry.action} (${entry.actionCount}/${entry.threshold}) — ${entry.outcome}`).join('\n')
-      : 'No anti-nuke detections have been recorded yet.';
+    const channel = interaction.options.getChannel('channel', false);
+    const clearChannel = interaction.options.getBoolean('clear', false);
+    if (channel && clearChannel) {
+      response = 'Choose a channel or clear the configured channel, not both.';
+    } else if (channel) {
+      const botPermissions = interaction.guild.members.me?.permissionsIn(channel);
+      if (!botPermissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
+        response = 'I need View Channel and Send Messages permissions in the selected anti-nuke log channel.';
+      } else {
+        config.antinukeLogChannelId = channel.id;
+        saveConfig(interaction.guildId, config);
+        response = `Anti-nuke logs will be sent to ${channel}.`;
+      }
+    } else if (clearChannel) {
+      config.antinukeLogChannelId = null;
+      saveConfig(interaction.guildId, config);
+      response = 'Anti-nuke log channel cleared.';
+    } else {
+      const entries = config.antinukeLogs.slice(0, 10);
+      response = entries.length
+        ? entries.map((entry) => `<t:${Math.floor(Date.parse(entry.timestamp) / 1000)}:R> <@${entry.executorId}> — ${entry.action} (${entry.actionCount}/${entry.threshold}) — ${entry.outcome}`).join('\n')
+        : 'No anti-nuke detections have been recorded yet.';
+      response += `\n\nLog channel: ${config.antinukeLogChannelId ? `<#${config.antinukeLogChannelId}>` : 'not set'}. Use \`/antinuke logs channel\` to configure it${config.antinukeLogChannelId ? ' or `/antinuke logs clear:true` to clear it' : ''}.`;
+    }
   } else if (subcommand === 'enable' || subcommand === 'disable') {
     config.enabled = subcommand === 'enable';
     saveConfig(interaction.guildId, config);
@@ -3512,7 +3602,17 @@ async function handleInteraction(interaction) {
   await interaction.reply({ content: response || 'No change made.', ephemeral: true });
 }
 
-client.on(Events.InteractionCreate, handleInteraction);
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!claimCommandEvent(`interaction:${interaction.id}`)) {
+    console.warn(`Ignoring duplicate Discord interaction event ${interaction.id}.`);
+    return;
+  }
+  try {
+    await handleInteraction(interaction);
+  } catch (error) {
+    console.error(`Could not handle Discord interaction ${interaction.id}:`, error);
+  }
+});
 
 client.on(Events.MessageDelete, (message) => {
   void logMediaDeletion(message);
@@ -4053,6 +4153,10 @@ async function dispatchPrefixCommand(message, parsed) {
       getRole: optionGetter(8),
     },
     async reply(payload) {
+      if (interaction.replied) {
+        console.error(`Suppressed duplicate reply for prefix command ${commandName} on message ${message.id}.`);
+        return responseMessage;
+      }
       const cleanPayload = makeCurrencyV2Payload(payload);
       cleanPayload.flags &= ~MessageFlags.Ephemeral;
       responseMessage = await message.reply(cleanPayload);
@@ -4064,11 +4168,34 @@ async function dispatchPrefixCommand(message, parsed) {
     },
   };
 
-  await handleInteraction(interaction);
+  try {
+    await handleInteraction(interaction);
+  } catch (error) {
+    if (interaction.replied) {
+      console.error(`Prefix command ${commandName} failed after replying to message ${message.id}:`, error);
+      return;
+    }
+    throw error;
+  }
 }
 
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.guild) return;
+
+  const prefix = getConfig(message.guild.id).prefix;
+  const normalizedPrefix = prefix ? String(prefix).trim() : '';
+  const trimmedContent = message.content.trimStart();
+  const prefixMatch = Boolean(prefix)
+    && trimmedContent.toLowerCase().startsWith(normalizedPrefix.toLowerCase());
+  const requestedCommandName = prefixMatch
+    ? trimmedContent.slice(normalizedPrefix.length).trim().split(/\s+/, 1)[0]?.toLowerCase()
+    : null;
+  const commandName = PREFIX_COMMAND_ALIASES[requestedCommandName] || requestedCommandName;
+  const isPrefixCommand = PREFIX_COMMAND_NAMES.has(commandName);
+  if (isPrefixCommand && !claimCommandEvent(`message:${message.id}`)) {
+    console.warn(`Ignoring duplicate prefix command event for message ${message.id}.`);
+    return;
+  }
 
   await logMediaUploads(message);
 
@@ -4081,7 +4208,7 @@ client.on(Events.MessageCreate, async (message) => {
       && entry.trigger.trim()
       && messageText.includes(normalize(entry.trigger)))
     .sort((first, second) => second.trigger.length - first.trigger.length)[0];
-  if (matchingResponder) {
+  if (matchingResponder && !isPrefixCommand) {
     try {
       await message.reply(makeCurrencyV2Payload({
         content: matchingResponder.response,
@@ -4101,12 +4228,7 @@ client.on(Events.MessageCreate, async (message) => {
 
   if (!externalInviteDeleted) await handleAntiScamImage(message);
 
-  const prefix = getConfig(message.guild.id).prefix;
   if (prefix) {
-    const normalizedPrefix = String(prefix).trim();
-    const trimmedContent = message.content.trimStart();
-    const prefixMatch = trimmedContent.toLowerCase().startsWith(normalizedPrefix.toLowerCase());
-
     if (prefixMatch) {
       const commandText = trimmedContent.slice(normalizedPrefix.length).trim();
       let parsed;
