@@ -28,7 +28,7 @@ const {
   TextInputStyle,
 } = require('discord.js');
 
-const { DISCORD_TOKEN, CLIENT_ID, DISCORD_GUILD_ID, OPENAI_API_KEY } = process.env;
+const { DISCORD_TOKEN, CLIENT_ID, OPENAI_API_KEY } = process.env;
 const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini';
 if (!DISCORD_TOKEN || !CLIENT_ID) {
   throw new Error('Set DISCORD_TOKEN and CLIENT_ID in your .env file.');
@@ -1867,11 +1867,8 @@ const client = new Client({
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-  const route = DISCORD_GUILD_ID
-    ? Routes.applicationGuildCommands(CLIENT_ID, DISCORD_GUILD_ID)
-    : Routes.applicationCommands(CLIENT_ID);
-  await rest.put(route, { body: commands });
-  console.log(`Registered anti-nuke commands${DISCORD_GUILD_ID ? ` for ${DISCORD_GUILD_ID}` : ' globally'}.`);
+  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+  console.log('Registered anti-nuke commands globally.');
 }
 
 client.once(Events.ClientReady, (readyClient) => {

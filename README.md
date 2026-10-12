@@ -16,8 +16,8 @@ quarantine (removing that user's roles); the detection window is five seconds.
 	bot in the Developer Portal. They are needed for kick detection and prefix
 	commands, respectively.
 4. Copy `.env.example` to `.env`, then set `DISCORD_TOKEN` and `CLIENT_ID`.
-	Set `DISCORD_GUILD_ID` to register commands immediately in one server;
-	otherwise commands are registered globally and may take time to appear.
+	Commands are registered globally and can take up to an hour to appear. No
+	Discord guild ID is required.
 	To use image scam detection, also set `OPENAI_API_KEY`.
 5. Run `npm install` and `npm start`.
 
