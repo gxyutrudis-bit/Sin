@@ -28,10 +28,13 @@ const {
   TextInputStyle,
 } = require('discord.js');
 
-const { DISCORD_TOKEN, CLIENT_ID, OPENAI_API_KEY } = process.env;
+const { DISCORD_TOKEN, CLIENT_ID, DISCORD_GUILD_ID, OPENAI_API_KEY } = process.env;
 const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini';
 if (!DISCORD_TOKEN || !CLIENT_ID) {
   throw new Error('Set DISCORD_TOKEN and CLIENT_ID in your .env file.');
+}
+if (!/^\d{17,20}$/.test(String(CLIENT_ID))) {
+  throw new Error('CLIENT_ID must be your Discord application ID (a numeric snowflake).');
 }
 
 const CONFIG_PATH = path.join(__dirname, '..', 'data', 'config.json');
@@ -1867,12 +1870,28 @@ const client = new Client({
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-  console.log('Registered anti-nuke commands globally.');
+  const routes = [
+    { label: 'global', route: Routes.applicationCommands(CLIENT_ID) },
+  ];
+
+  if (DISCORD_GUILD_ID) {
+    routes.push({ label: 'guild', route: Routes.applicationGuildCommands(CLIENT_ID, DISCORD_GUILD_ID) });
+  }
+
+  for (const { label, route } of routes) {
+    const result = await rest.put(route, { body: commands });
+    console.log(`Registered ${result.length} slash commands ${label === 'guild' ? `for guild ${DISCORD_GUILD_ID}` : 'globally'}.`);
+  }
 }
 
-client.once(Events.ClientReady, (readyClient) => {
+client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Anti-nuke protection bot ready as ${readyClient.user.tag}.`);
+
+  try {
+    await registerCommands();
+  } catch (error) {
+    console.error('Could not register slash commands after login:', error.message);
+  }
 });
 
 async function handleInteraction(interaction) {
@@ -3926,7 +3945,6 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 async function start() {
-  await registerCommands();
   await client.login(DISCORD_TOKEN);
 }
 
