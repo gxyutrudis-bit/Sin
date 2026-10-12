@@ -18,6 +18,7 @@ const {
   MediaGalleryItemBuilder,
   MessageFlags,
   ModalBuilder,
+  Partials,
   PermissionFlagsBits,
   REST,
   Routes,
@@ -39,6 +40,11 @@ const DEFAULT_CONFIG = {
   externalInviteBlockingEnabled: true,
   antiScamImagesEnabled: false,
   antiScamLogChannelId: null,
+  imageLogChannelId: null,
+  videoLogChannelId: null,
+  actionLogChannelId: null,
+  voiceLogChannelId: null,
+  messageLogChannelId: null,
   threshold: 1,
   windowSeconds: 5,
   punishment: 'quarantine',
@@ -75,13 +81,15 @@ const DEFAULT_CONFIG = {
 const recentActions = new Map();
 const protectedExecutors = new Set();
 const tempVoiceOwners = new Map();
+const voiceJoinTimes = new Map();
+const voiceStreamStartTimes = new Map();
 const activeMinesGames = new Map();
 const activeBlackjackGames = new Map();
 const activeBlackjackPvPGames = new Map();
 const MINES_TILE_COUNT = 12;
 const MINES_MAX_BOMBS = 6;
 const PREFIX_COMMAND_ALIASES = { av: 'avatar', ava: 'avatar', cv: 'cover' };
-const PREFIX_COMMAND_NAMES = new Set(['afk', 'avatar', 'cover', 'role']);
+const PREFIX_COMMAND_NAMES = new Set(['afk', 'avatar', 'cover', 'currency', 'role']);
 
 function makeCurrencyV2Payload(payload, ephemeral = false) {
   const message = typeof payload === 'string' ? { content: payload } : payload;
@@ -131,6 +139,91 @@ function makeCurrencyV2Payload(payload, ephemeral = false) {
   return result;
 }
 
+function makeMediaLogPayload(content, media) {
+  const container = new ContainerBuilder()
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(content))
+    .addMediaGalleryComponents(new MediaGalleryBuilder().addItems(
+      new MediaGalleryItemBuilder().setURL(`attachment://${media.name}`),
+    ));
+  return {
+    components: [container],
+    files: [{ attachment: media.attachment, name: media.name }],
+    flags: MessageFlags.IsComponentsV2,
+    allowedMentions: { parse: [] },
+  };
+}
+
+async function sendActionLog(guild, action, details, userId = null) {
+  const channelId = getConfig(guild.id).actionLogChannelId;
+  if (!channelId) return;
+
+  try {
+    const logChannel = guild.channels.cache.get(channelId)
+      || await guild.channels.fetch(channelId).catch((error) => {
+        console.error(`Could not fetch action log channel ${channelId} in ${guild.name}:`, error);
+        return null;
+      });
+    if (!logChannel?.isTextBased()) {
+      console.error(`Configured action log channel ${channelId} is unavailable or not text-based in ${guild.name}.`);
+      return;
+    }
+    const content = [
+      `## ${action}`,
+      ...details,
+      `Time: <t:${Math.floor(Date.now() / 1000)}:F>`,
+      `-# User ID: ${userId || 'Unknown'}`,
+    ].join('\n');
+    await logChannel.send(makeCurrencyV2Payload({ content, allowedMentions: { parse: [] } }));
+  } catch (error) {
+    console.error(`Could not send action log to ${channelId} in ${guild.name}:`, error);
+  }
+}
+
+async function sendVoiceLog(guild, title, details, userId) {
+  const channelId = getConfig(guild.id).voiceLogChannelId;
+  if (!channelId) return;
+
+  try {
+    const logChannel = guild.channels.cache.get(channelId)
+      || await guild.channels.fetch(channelId).catch((error) => {
+        console.error(`Could not fetch voice log channel ${channelId} in ${guild.name}:`, error);
+        return null;
+      });
+    if (!logChannel?.isTextBased()) {
+      console.error(`Configured voice log channel ${channelId} is unavailable or not text-based in ${guild.name}.`);
+      return;
+    }
+    const philippinesTime = new Intl.DateTimeFormat('en-PH', {
+      timeZone: 'Asia/Manila',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    }).format(new Date());
+    const content = [
+      `## ${title}`,
+      ...details,
+      `-# User ID: ${userId} | Today at ${philippinesTime} PHT`,
+    ].join('\n');
+    await logChannel.send(makeCurrencyV2Payload({ content, allowedMentions: { parse: [] } }));
+  } catch (error) {
+    console.error(`Could not send voice log to ${channelId} in ${guild.name}:`, error);
+  }
+}
+
+function formatVoiceDuration(durationMs) {
+  let remainingSeconds = Math.max(0, Math.floor(durationMs / 1000));
+  const hours = Math.floor(remainingSeconds / 3600);
+  remainingSeconds %= 3600;
+  const minutes = Math.floor(remainingSeconds / 60);
+  const seconds = remainingSeconds % 60;
+  const parts = [];
+  if (hours) parts.push(`${hours} hour${hours === 1 ? '' : 's'}`);
+  if (minutes) parts.push(`${minutes} minute${minutes === 1 ? '' : 's'}`);
+  if (seconds || !parts.length) parts.push(`${seconds} second${seconds === 1 ? '' : 's'}`);
+  if (parts.length < 2) return parts[0];
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
 function readConfigs() {
   try {
     const configs = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
@@ -159,6 +252,11 @@ function getConfig(guildId) {
     ticketCategoryId: saved.ticketCategoryId || null,
     transcriptChannelId: saved.transcriptChannelId || null,
     antiScamLogChannelId: saved.antiScamLogChannelId || null,
+    imageLogChannelId: saved.imageLogChannelId || null,
+    videoLogChannelId: saved.videoLogChannelId || null,
+    actionLogChannelId: saved.actionLogChannelId || null,
+    voiceLogChannelId: saved.voiceLogChannelId || null,
+    messageLogChannelId: saved.messageLogChannelId || null,
     externalInviteBlockingEnabled: typeof saved.externalInviteBlockingEnabled === 'boolean'
       ? saved.externalInviteBlockingEnabled
       : typeof saved.enabled === 'boolean' ? saved.enabled : DEFAULT_CONFIG.externalInviteBlockingEnabled,
@@ -288,6 +386,178 @@ async function isInviteForGuild(guild, inviteCode) {
   } catch (error) {
     console.error(`Could not check whether invite ${inviteCode} belongs to ${guild.name} (${guild.id}):`, error.message);
     return false;
+  }
+}
+
+async function downloadMediaForLog(message, attachment, kind, index) {
+  const sourceType = attachment.contentType?.split(';', 1)[0].toLowerCase();
+  const imageExtensions = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+    'image/avif': 'avif',
+  };
+  if (kind === 'image' && !imageExtensions[sourceType]) return null;
+  if (kind === 'video' && !sourceType?.startsWith('video/')) return null;
+
+  const maxFileBytes = 500 * 1024 * 1024;
+  if (attachment.size > maxFileBytes) {
+    console.warn(`Skipping oversized ${kind} attachment ${attachment.id} in guild ${message.guild.id}.`);
+    return null;
+  }
+  const url = new URL(attachment.url);
+  if (!['cdn.discordapp.com', 'media.discordapp.net'].includes(url.hostname)) {
+    throw new Error(`Refusing to fetch media from unexpected host: ${url.hostname}`);
+  }
+  const response = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+  if (!response.ok) throw new Error(`Could not download Discord media (${response.status}).`);
+  const finalUrl = new URL(response.url);
+  if (!['cdn.discordapp.com', 'media.discordapp.net'].includes(finalUrl.hostname)) {
+    throw new Error(`Discord media redirected to unexpected host: ${finalUrl.hostname}`);
+  }
+  const contentType = response.headers.get('content-type')?.split(';', 1)[0].toLowerCase();
+  if (kind === 'image' && !imageExtensions[contentType]) throw new Error(`Attachment ${attachment.id} is not a supported image.`);
+  if (kind === 'video' && !contentType?.startsWith('video/')) throw new Error(`Attachment ${attachment.id} is not a video.`);
+  const contentLength = Number(response.headers.get('content-length'));
+  if (contentLength > maxFileBytes) {
+    console.warn(`Skipping oversized ${kind} response ${attachment.id} in guild ${message.guild.id}.`);
+    return null;
+  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.length > maxFileBytes) {
+    console.warn(`Skipping oversized ${kind} response ${attachment.id} in guild ${message.guild.id}.`);
+    return null;
+  }
+  const videoExtensions = { 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov', 'video/ogg': 'ogv' };
+  const extension = kind === 'image'
+    ? imageExtensions[contentType]
+    : videoExtensions[contentType] || contentType.split('/')[1].replace(/[^a-z0-9]/g, '') || 'video';
+  return {
+    attachment: buffer,
+    name: `upload-${kind}-${message.id}-${index + 1}.${extension}`,
+  };
+}
+
+async function logMediaUploads(message) {
+  const config = getConfig(message.guild.id);
+  const mediaTypes = [
+    { kind: 'image', channelId: config.imageLogChannelId },
+    { kind: 'video', channelId: config.videoLogChannelId },
+  ];
+  for (const { kind, channelId } of mediaTypes) {
+    if (!channelId) continue;
+    const attachments = [...message.attachments.values()]
+      .filter((attachment) => kind === 'image'
+        ? attachment.contentType?.split(';', 1)[0].toLowerCase().startsWith('image/')
+        : attachment.contentType?.split(';', 1)[0].toLowerCase().startsWith('video/'));
+    if (!attachments.length) continue;
+
+    const logChannel = message.guild.channels.cache.get(channelId)
+      || await message.guild.channels.fetch(channelId).catch((error) => {
+        console.error(`Could not fetch ${kind} log channel ${channelId} in ${message.guild.name}:`, error);
+        return null;
+      });
+    if (!logChannel?.isTextBased()) {
+      console.error(`Configured ${kind} log channel ${channelId} is unavailable or not text-based in ${message.guild.name}.`);
+      continue;
+    }
+
+    for (let index = 0; index < attachments.length; index += 1) {
+      try {
+        const media = await downloadMediaForLog(message, attachments[index], kind, index);
+        if (!media) continue;
+        const content = [
+          `## ${kind === 'image' ? 'Image' : 'Video'} upload`,
+          `Source: [Jump to message](${message.url})`,
+          `Author: ${message.author.tag} (${message.author.id})`,
+          `Channel: ${message.channel}`,
+        ].join('\n');
+        await logChannel.send(makeMediaLogPayload(content, media));
+      } catch (error) {
+        console.error(`Could not log ${kind} attachment ${attachments[index].id} in ${message.guild.name}:`, error);
+      }
+    }
+  }
+}
+
+async function findMessageDeleteExecutor(message, observedAt) {
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  try {
+    const auditLogs = await message.guild.fetchAuditLogs({ type: AuditLogEvent.MessageDelete, limit: 10 });
+    const entry = auditLogs.entries.find((candidate) =>
+      candidate.target?.id === message.author?.id
+      && candidate.extra?.channel?.id === message.channelId
+      && candidate.createdTimestamp <= observedAt + 3_000
+      && observedAt - candidate.createdTimestamp < 15_000);
+    return entry?.executor || null;
+  } catch (error) {
+    console.error(`Could not determine who deleted media message ${message.id} in ${message.guild.name}:`, error.message);
+    return null;
+  }
+}
+
+async function logMediaDeletion(message) {
+  if (!message.guild) return;
+  const config = getConfig(message.guild.id);
+  const attachments = [...(message.attachments?.values() || [])];
+  const mediaKinds = [
+    { kind: 'image', channelId: config.imageLogChannelId },
+    { kind: 'video', channelId: config.videoLogChannelId },
+  ].filter(({ kind, channelId }) => channelId && attachments.some((attachment) => {
+    const contentType = attachment.contentType?.split(';', 1)[0].toLowerCase();
+    return kind === 'image' ? contentType?.startsWith('image/') : contentType?.startsWith('video/');
+  }));
+  if (!config.messageLogChannelId && !mediaKinds.length) return;
+
+  const deleter = message.author ? await findMessageDeleteExecutor(message, Date.now()) : null;
+  const channelId = message.channelId;
+  const authorLabel = message.author
+    ? `${message.author.tag || message.author.username} (${message.author.id})`
+    : 'Unknown (message was not cached)';
+  const deleterLabel = deleter ? `${deleter.tag} (${deleter.id})` : 'Unknown (no matching audit-log entry)';
+  const jumpLink = message.url || `https://discord.com/channels/${message.guild.id}/${channelId}/${message.id}`;
+
+  if (config.messageLogChannelId) {
+    const logChannel = message.guild.channels.cache.get(config.messageLogChannelId)
+      || await message.guild.channels.fetch(config.messageLogChannelId).catch((error) => {
+        console.error(`Could not fetch message log channel ${config.messageLogChannelId} in ${message.guild.name}:`, error);
+        return null;
+      });
+    if (logChannel?.isTextBased()) {
+      const content = [
+        '## Message Deleted',
+        `Author: ${authorLabel}`,
+        `Deleted by: ${deleterLabel}`,
+        `Content: ${message.content?.slice(0, 1000) || 'No text content or message was not cached'}`,
+        `Source: [Jump to message](${jumpLink})`,
+        `Channel: <#${channelId}>`,
+      ].join('\n');
+      await logChannel.send(makeCurrencyV2Payload({ content, allowedMentions: { parse: [] } })).catch((error) => {
+        console.error(`Could not send message deletion log to ${config.messageLogChannelId} in ${message.guild.name}:`, error);
+      });
+    }
+  }
+
+  for (const { kind, channelId } of mediaKinds) {
+    const logChannel = message.guild.channels.cache.get(channelId)
+      || await message.guild.channels.fetch(channelId).catch((error) => {
+        console.error(`Could not fetch ${kind} log channel ${channelId} in ${message.guild.name}:`, error);
+        return null;
+      });
+    if (!logChannel?.isTextBased()) continue;
+
+    const mediaName = kind === 'image' ? 'Image' : 'Video';
+    const content = [
+      `## ${mediaName} Deleted`,
+      `Author: ${authorLabel}`,
+      `Deleted by: ${deleterLabel}`,
+      `Source: [Jump to message](${jumpLink})`,
+      `Channel: <#${channelId}>`,
+    ].join('\n');
+    await logChannel.send(makeCurrencyV2Payload({ content, allowedMentions: { parse: [] } })).catch((error) => {
+      console.error(`Could not send ${kind} deletion log to ${channelId} in ${message.guild.name}:`, error);
+    });
   }
 }
 
@@ -1181,6 +1451,50 @@ const commands = [
         .setDescription('Channel for scam image detection logs; leave empty to clear')
         .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))),
   new SlashCommandBuilder()
+    .setName('image')
+    .setDescription('Configure image upload logs')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand((command) => command
+      .setName('logs')
+      .setDescription('Set or clear the image upload log channel')
+      .addChannelOption((option) => option
+        .setName('channel')
+        .setDescription('Channel for image uploads; leave empty to clear')
+        .addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]))),
+  new SlashCommandBuilder()
+    .setName('videos')
+    .setDescription('Configure video upload logs')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand((command) => command
+      .setName('logs')
+      .setDescription('Set or clear the video upload log channel')
+      .addChannelOption((option) => option
+        .setName('channel')
+        .setDescription('Channel for video uploads; leave empty to clear')
+        .addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]))),
+  new SlashCommandBuilder()
+    .setName('action')
+    .setDescription('Configure server action logs')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand((command) => command
+      .setName('logs')
+      .setDescription('Set or clear the action log channel')
+      .addChannelOption((option) => option
+        .setName('channel')
+        .setDescription('Channel for server action logs; leave empty to clear')
+        .addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]))),
+  new SlashCommandBuilder()
+    .setName('voice')
+    .setDescription('Configure voice activity logs')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand((command) => command
+      .setName('logs')
+      .setDescription('Set or clear the voice log channel')
+      .addChannelOption((option) => option
+        .setName('channel')
+        .setDescription('Channel for voice activity logs; leave empty to clear')
+        .addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]))),
+  new SlashCommandBuilder()
     .setName('autorole')
     .setDescription('Set the role given to every new member')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
@@ -1310,10 +1624,25 @@ const commands = [
     .addBooleanOption((option) => option.setName('preview').setDescription('Send a preview in the selected channel').setRequired(false)),
   new SlashCommandBuilder()
     .setName('message')
-    .setDescription('Send a message in any text channel as the bot')
+    .setDescription('Send messages and configure deletion logs')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addChannelOption((option) => option.setName('channel').setDescription('Channel to send the message in').addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]).setRequired(true))
-    .addStringOption((option) => option.setName('text').setDescription('Text to send').setMinLength(1).setMaxLength(2000).setRequired(true)),
+    .addSubcommand((command) => command
+      .setName('send')
+      .setDescription('Send a message in a text channel as the bot')
+      .addChannelOption((option) => option.setName('channel').setDescription('Channel to send the message in').addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]).setRequired(true))
+      .addStringOption((option) => option.setName('text').setDescription('Text to send').setMinLength(1).setMaxLength(2000).setRequired(true)))
+    .addSubcommand((command) => command
+      .setName('logs')
+      .setDescription('Set or clear the deleted-message log channel')
+      .addChannelOption((option) => option.setName('channel').setDescription('Channel for deletion logs; leave empty to clear').addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]))),
+  new SlashCommandBuilder()
+    .setName('prefix')
+    .setDescription('Configure the server text-command prefix')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand((command) => command
+      .setName('set')
+      .setDescription('Set the text-command prefix, or use off to disable it')
+      .addStringOption((option) => option.setName('prefix').setDescription('Prefix (1-5 characters) or off').setMinLength(1).setMaxLength(5).setRequired(true))),
   new SlashCommandBuilder()
     .setName('set')
     .setDescription('Server configuration commands')
@@ -1332,10 +1661,6 @@ const commands = [
         .addChannelTypes([ChannelType.GuildVoice])
         .setRequired(true))
       .addStringOption((option) => option.setName('roomname').setDescription('Template for temp room names, example: {user}s room').setRequired(false)))
-    .addSubcommand((command) => command
-      .setName('prefix')
-      .setDescription('Set the text-command prefix, or use off to disable it')
-      .addStringOption((option) => option.setName('value').setDescription('Prefix (1-5 characters) or off').setMinLength(1).setMaxLength(5).setRequired(true)))
     .addSubcommand((command) => command
       .setName('owner')
       .setDescription('Set the owner-protected role')
@@ -1536,7 +1861,8 @@ async function sendTempVoiceControls(channel, ownerUser, ownerId, moveFailed = f
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildModeration, GatewayIntentBits.GuildMembers, GatewayIntentBits.MessageContent],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildModeration, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildInvites, GatewayIntentBits.GuildEmojisAndStickers, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.MessageContent],
+  partials: [Partials.Message],
 });
 
 async function registerCommands() {
@@ -1792,6 +2118,105 @@ async function handleInteraction(interaction) {
 
   if (!interaction.isChatInputCommand()) return;
 
+  if (interaction.commandName === 'action') {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+      return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      await interaction.reply({ content: 'Administrator permission is required.', ephemeral: true });
+      return;
+    }
+
+    const channel = interaction.options.getChannel('channel', false);
+    if (channel) {
+      const botPermissions = interaction.guild.members.me?.permissionsIn(channel);
+      if (!botPermissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
+        await interaction.reply({
+          content: 'I need View Channel and Send Messages permissions in the selected action log channel.',
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+    const config = getConfig(interaction.guildId);
+    config.actionLogChannelId = channel?.id || null;
+    saveConfig(interaction.guildId, config);
+    await interaction.reply({
+      content: channel ? `Server action logs will be sent to ${channel}.` : 'Action log channel cleared.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (interaction.commandName === 'voice') {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+      return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      await interaction.reply({ content: 'Administrator permission is required.', ephemeral: true });
+      return;
+    }
+
+    const channel = interaction.options.getChannel('channel', false);
+    if (channel) {
+      const botPermissions = interaction.guild.members.me?.permissionsIn(channel);
+      if (!botPermissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
+        await interaction.reply({
+          content: 'I need View Channel and Send Messages permissions in the selected voice log channel.',
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+    const config = getConfig(interaction.guildId);
+    config.voiceLogChannelId = channel?.id || null;
+    saveConfig(interaction.guildId, config);
+    await interaction.reply({
+      content: channel ? `Voice activity logs will be sent to ${channel}.` : 'Voice log channel cleared.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (interaction.commandName === 'image' || interaction.commandName === 'videos') {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+      return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      await interaction.reply({ content: 'Administrator permission is required.', ephemeral: true });
+      return;
+    }
+
+    const channel = interaction.options.getChannel('channel', false);
+    if (channel) {
+      const botPermissions = interaction.guild.members.me?.permissionsIn(channel);
+      const requiredPermissions = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles];
+      if (!botPermissions?.has(requiredPermissions)) {
+        await interaction.reply({
+          content: 'I need View Channel, Send Messages, and Attach Files permissions in the selected log channel.',
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+
+    const config = getConfig(interaction.guildId);
+    const configKey = interaction.commandName === 'image' ? 'imageLogChannelId' : 'videoLogChannelId';
+    config[configKey] = channel?.id || null;
+    saveConfig(interaction.guildId, config);
+    const mediaName = interaction.commandName === 'image' ? 'Image' : 'Video';
+    await interaction.reply({
+      content: channel
+        ? `${mediaName} uploads will be logged in ${channel} with the original media and a jump link.`
+        : `${mediaName} upload log channel cleared.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
   if (['avatar', 'av', 'cover', 'cv'].includes(interaction.commandName)) {
     const target = interaction.options.getUser('user', false) || interaction.user;
     const isCover = interaction.commandName === 'cover' || interaction.commandName === 'cv';
@@ -1963,6 +2388,28 @@ async function handleInteraction(interaction) {
       return;
     }
 
+    if (interaction.options.getSubcommand() === 'logs') {
+      const logChannel = interaction.options.getChannel('channel', false);
+      if (logChannel) {
+        const botPermissions = interaction.guild.members.me?.permissionsIn(logChannel);
+        if (!botPermissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
+          await interaction.reply({
+            content: 'I need View Channel and Send Messages permissions in the selected message log channel.',
+            ephemeral: true,
+          });
+          return;
+        }
+      }
+      const config = getConfig(interaction.guildId);
+      config.messageLogChannelId = logChannel?.id || null;
+      saveConfig(interaction.guildId, config);
+      await interaction.reply({
+        content: logChannel ? `Deleted message logs will be sent to ${logChannel}.` : 'Message log channel cleared.',
+        ephemeral: true,
+      });
+      return;
+    }
+
     const targetChannel = interaction.options.getChannel('channel', true);
     const text = interaction.options.getString('text', true).trim();
 
@@ -1972,12 +2419,38 @@ async function handleInteraction(interaction) {
     }
 
     try {
-      await targetChannel.send({ content: text, allowedMentions: { parse: [] } });
+      await targetChannel.send(makeCurrencyV2Payload({ content: text, allowedMentions: { parse: [] } }));
       await interaction.reply({ content: `Message sent in ${targetChannel}.`, ephemeral: true });
     } catch (error) {
       console.error(`Could not send bot message to ${targetChannel.id}:`, error.message);
       await interaction.reply({ content: 'I could not send that message to the selected channel.', ephemeral: true });
     }
+    return;
+  }
+
+  if (interaction.commandName === 'prefix') {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+      return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      await interaction.reply({ content: 'Administrator permission is required.', ephemeral: true });
+      return;
+    }
+
+    const rawValue = interaction.options.getString('prefix', true).trim();
+    const value = rawValue.toLowerCase() === 'off' ? 'off' : rawValue;
+    if (value !== 'off' && /\s/.test(value)) {
+      await interaction.reply({ content: 'The prefix cannot contain spaces.', ephemeral: true });
+      return;
+    }
+    const config = getConfig(interaction.guildId);
+    config.prefix = value === 'off' ? null : value;
+    saveConfig(interaction.guildId, config);
+    await interaction.reply({
+      content: config.prefix ? `Text command prefix set to \`${config.prefix}\`.` : 'Text commands disabled.',
+      ephemeral: true,
+    });
     return;
   }
 
@@ -2036,23 +2509,6 @@ async function handleInteraction(interaction) {
 
       await interaction.reply({
         content: `Temporary voice rooms enabled. Users who join ${joinChannel} will create a room in ${category}.`,
-        ephemeral: true,
-      });
-      return;
-    }
-
-    if (sub === 'prefix') {
-      const rawValue = interaction.options.getString('value', true).trim();
-      const value = rawValue.toLowerCase() === 'off' ? 'off' : rawValue;
-      if (value !== 'off' && /\s/.test(value)) {
-        await interaction.reply({ content: 'The prefix cannot contain spaces.', ephemeral: true });
-        return;
-      }
-      const config = getConfig(interaction.guildId);
-      config.prefix = value === 'off' ? null : value;
-      saveConfig(interaction.guildId, config);
-      await interaction.reply({
-        content: config.prefix ? `Text command prefix set to \`${config.prefix}\`.` : 'Text commands disabled.',
         ephemeral: true,
       });
       return;
@@ -2540,6 +2996,10 @@ async function handleInteraction(interaction) {
 
 client.on(Events.InteractionCreate, handleInteraction);
 
+client.on(Events.MessageDelete, (message) => {
+  void logMediaDeletion(message);
+});
+
 async function findExecutor(guild, auditType, targetId) {
   try {
     const logs = await guild.fetchAuditLogs({ type: auditType, limit: 6 });
@@ -2620,11 +3080,76 @@ async function handleDestructiveAction(guild, auditType, targetId, label) {
 }
 
 client.on(Events.ChannelDelete, (channel) => {
-  if (channel.guild) void handleDestructiveAction(channel.guild, AuditLogEvent.ChannelDelete, channel.id, 'channel deletion');
+  if (!channel.guild) return;
+  void handleDestructiveAction(channel.guild, AuditLogEvent.ChannelDelete, channel.id, 'channel deletion');
+  const isVoiceChannel = [ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(channel.type);
+  void sendActionLog(channel.guild, isVoiceChannel ? 'Voice Channel Deleted' : 'Channel Deleted', [
+    `Name: ${channel.name || 'Unknown'}`,
+    `ID: ${channel.id}`,
+  ]);
+});
+
+client.on(Events.ChannelCreate, (channel) => {
+  if (!channel.guild) return;
+  const isVoiceChannel = [ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(channel.type);
+  void sendActionLog(channel.guild, isVoiceChannel ? 'Voice Channel Created' : 'Channel Created', [
+    `Name: ${channel.name || 'Unknown'}`,
+    `ID: ${channel.id}`,
+    `Type: ${ChannelType[channel.type] || channel.type}`,
+  ]);
+});
+
+client.on(Events.InviteCreate, (invite) => {
+  if (!invite.guild) return;
+  const inviterId = invite.inviterId || invite.inviter?.id || null;
+  const creator = inviterId ? `<@${inviterId}>` : 'An unknown user';
+  const inviteUrl = invite.code ? `https://discord.gg/${invite.code}` : 'an invite link';
+  const channel = invite.channel ? `<#${invite.channel.id}>` : 'an unknown channel';
+  void sendActionLog(
+    invite.guild,
+    'Invite Created',
+    [`${creator} created an invite link (${inviteUrl}) for ${channel}.`],
+    inviterId,
+  );
+});
+
+client.on(Events.GuildEmojiCreate, (emoji) => {
+  void sendActionLog(emoji.guild, 'Emoji Created', [
+    `Name: ${emoji.name || 'Unknown'}`,
+    `ID: ${emoji.id}`,
+  ]);
+});
+
+client.on(Events.GuildStickerCreate, (sticker) => {
+  void sendActionLog(sticker.guild, 'Sticker Created', [
+    `Name: ${sticker.name || 'Unknown'}`,
+    `ID: ${sticker.id}`,
+  ]);
+});
+
+client.on(Events.GuildRoleCreate, (role) => {
+  void sendActionLog(role.guild, 'Role Created', [
+    `Name: ${role.name}`,
+    `ID: ${role.id}`,
+  ]);
+});
+
+client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
+  const addedRoles = newMember.roles.cache.filter((role) => !oldMember.roles.cache.has(role.id));
+  for (const role of addedRoles.values()) {
+    void sendActionLog(newMember.guild, 'Role Added to Member', [
+      `Member: ${newMember.user.tag} (${newMember.id})`,
+      `Role: ${role.name} (${role.id})`,
+    ], newMember.id);
+  }
 });
 
 client.on(Events.GuildRoleDelete, (role) => {
   void handleDestructiveAction(role.guild, AuditLogEvent.RoleDelete, role.id, 'role deletion');
+  void sendActionLog(role.guild, 'Role Deleted', [
+    `Name: ${role.name}`,
+    `ID: ${role.id}`,
+  ]);
 });
 
 client.on(Events.GuildBanAdd, (ban) => {
@@ -2673,8 +3198,56 @@ client.on(Events.GuildMemberAdd, async (member) => {
 });
 
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
-  if (!newState.channel || oldState.channelId === newState.channelId) return;
   const guild = newState.guild;
+  const member = newState.member || oldState.member;
+  const userId = newState.id;
+  const memberLabel = member ? `${member.user.tag} (<@${userId}>)` : `<@${userId}>`;
+  const joinKey = `${guild.id}:${userId}`;
+  const joinedAt = voiceJoinTimes.get(joinKey);
+
+  if (oldState.channelId !== newState.channelId) {
+    if (oldState.channelId && newState.channelId) {
+      const duration = joinedAt ? ` Joined for ${formatVoiceDuration(Date.now() - joinedAt)}.` : '';
+      void sendVoiceLog(guild, 'Channel Changed', [
+        `<@${userId}> moved from **${oldState.channel?.name || oldState.channelId}** voice channel into **${newState.channel?.name || newState.channelId}** voice channel.${duration}`,
+      ], userId);
+      voiceJoinTimes.set(joinKey, Date.now());
+    } else if (newState.channel) {
+      voiceJoinTimes.set(joinKey, Date.now());
+      void sendVoiceLog(guild, 'Joined Voice Channel', [
+        `<@${userId}> joined the **${newState.channel.name}** voice channel.`,
+      ], userId);
+    } else if (oldState.channel) {
+      const duration = joinedAt ? ` Joined for ${formatVoiceDuration(Date.now() - joinedAt)}.` : '';
+      voiceJoinTimes.delete(joinKey);
+      void sendVoiceLog(guild, 'Left Voice Channel', [
+        `<@${userId}> left the **${oldState.channel.name}** voice channel.${duration}`,
+      ], userId);
+    }
+  }
+
+  if (oldState.streaming !== newState.streaming) {
+    const channel = newState.channel || oldState.channel;
+    const streamKey = `${guild.id}:${userId}`;
+    if (newState.streaming) {
+      voiceStreamStartTimes.set(streamKey, Date.now());
+      void sendVoiceLog(guild, 'Stream Started', [
+        `<@${userId}> started streaming in the **${channel?.name || 'unknown'}** voice channel.`,
+      ], userId);
+    } else {
+      const streamStartedAt = voiceStreamStartTimes.get(streamKey);
+      voiceStreamStartTimes.delete(streamKey);
+      const duration = streamStartedAt
+        ? `Streamed for ${formatVoiceDuration(Date.now() - streamStartedAt)}.`
+        : 'Stream duration unavailable because the start was not observed.';
+      void sendVoiceLog(guild, 'Stream Ended', [
+        `<@${userId}> stopped streaming in the **${channel?.name || 'unknown'}** voice channel.`,
+        `Streamer: ${duration}`,
+      ], userId);
+    }
+  }
+
+  if (!newState.channel || oldState.channelId === newState.channelId) return;
   const config = getConfig(guild.id);
   const tempVoice = config.tempVoice || {};
 
@@ -2841,7 +3414,7 @@ async function parsePrefixCommand(message, input) {
   const requestedName = tokens.shift()?.toLowerCase();
   const commandName = PREFIX_COMMAND_ALIASES[requestedName] || requestedName;
   if (!PREFIX_COMMAND_NAMES.has(commandName)) {
-    throw new Error('The configured prefix only supports afk, av, ava, cover, cv, and role.');
+    return null;
   }
 
   const command = commands.find((entry) => entry.name === commandName);
@@ -2957,6 +3530,8 @@ async function dispatchPrefixCommand(message, parsed) {
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.guild) return;
 
+  await logMediaUploads(message);
+
   const autoresponders = getConfig(message.guild.id).autoresponders;
   const normalize = (value) => value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
   const messageText = normalize(message.content);
@@ -3001,6 +3576,7 @@ client.on(Events.MessageCreate, async (message) => {
         await message.reply(makeCurrencyV2Payload(error.message));
         return;
       }
+      if (!parsed) return;
 
       try {
         await dispatchPrefixCommand(message, parsed);

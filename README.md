@@ -33,6 +33,17 @@ Use `/antinuke status`, `/antinuke enable`, `/antinuke disable`,
 server administrators. Configuration is saved in `data/config.json`.
 `/antinuke logs` shows the latest 10 recorded detections and their outcomes;
 up to 25 entries per server are retained across bot restarts.
+Use `/action logs` with a channel to configure V2 logs for created invites,
+emojis, stickers, channels and voice channels, added roles, and deleted roles.
+Leave the channel option empty to clear it. The bot needs View Channel and Send
+Messages in the selected channel.
+Use `/voice logs` to set a separate V2 log channel for voice joins, leaves,
+channel changes, and screen-share starts/stops. The bot requests Discord's Guild
+Voice States gateway intent to receive these events.
+Use `/message logs` to set a V2 log channel for deleted messages. Each entry
+includes the author, content, and the deleting user when Discord's audit log
+provides a matching record. The existing message-sending command is now
+`/message send`. Grant the bot **View Audit Log** for deleter attribution.
 Use `/enable` and `/disable` to turn external Discord invite blocking on or
 off. While enabled, only members with a role added through `/whitelist role`
 can post invites to other servers; messages containing those invites are
@@ -50,7 +61,18 @@ that data sharing is appropriate for your server. The classifier can make
 mistakes; review logs and ensure the bot has **Manage Messages** and permission
 to send messages and embeds in the configured log channel.
 
-Use `/set prefix` with any 1-5 character prefix, such as `!`, to enable
+Use `/image logs` and `/videos logs` to set separate upload log channels. Every
+supported image or video attachment sent in the server is reposted as a
+Discord Components V2 media gallery with a **Jump to message** link to its
+original post. The bot needs **View Channel**, **Send Messages**, and **Attach
+Files** in each log channel; individual files over 500 MB are skipped. Discord
+may enforce a lower upload limit for the bot or server. Deleted media receives
+a second V2 log with its author and the deleter when available; grant the bot
+**View Audit Log** for attribution. Discord may not expose an actor for every
+deletion, so those entries are labeled unknown when no matching audit record is
+available.
+
+Use `/prefix set` with any 1-5 character prefix, such as `!`, to enable
 prefix commands; use `off` to disable them. Only `afk`, `av`, `ava`, `cover`,
 `cv`, and `role` are available through the configured prefix. For example,
 `!afk [reason]`, `!av [@user]`, `!cover [@user]`, and
@@ -82,8 +104,10 @@ The server currency game uses `/currency balance`, `/currency leader`,
 `/currency cluck`. `/currency give` transfers coins from the configured owner
 to a member; `/currency add` adds new coins to a member's balance. These two
 commands are restricted to the server owner and the role configured with
-`/set owner`. These commands are available as slash commands only. Currency
-replies use Discord Components V2 containers. The leader command lists the top
+`/set owner`. Currency commands also work with the configured text prefix, for
+example `!currency balance` or `!currency flip 100 heads`; replace `!` with the
+prefix set using `/prefix set`. Currency replies use Discord Components V2
+containers. The leader command lists the top
 10 coin balances in the server. Players start with 100 virtual coins and can claim a random
 800-2,000 coins once every 24 hours. Coin
 flip and gamble are even-money 50/50 games; Slots pays 3x-10x for three matching
