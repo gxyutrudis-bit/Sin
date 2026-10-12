@@ -4,6 +4,7 @@ services:
   sinclair:
     build: .
     container_name: sinclair-discord-bot
+    network_mode: host
     env_file:
       - .env
     volumes:
